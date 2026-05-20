@@ -1,0 +1,71 @@
+name: bankiru-reviews
+
+# Three services share a single image (built once from ./Dockerfile) and a
+# single env file. The env file is written by scripts/start.sh after
+# pulling secrets from Infisical into /dev/shm (tmpfs — secrets never
+# touch disk and are wiped on host reboot).
+#
+# External dependencies (Postgres + S3-compatible OBS + Authentik) are
+# NOT managed here; only api + parser + ui run in this compose project.
+
+x-env-file: &env_file
+  env_file:
+    - /dev/shm/bankiru-reviews-secrets/.env
+
+services:
+  api:
+    build:
+      context: .
+    image: bankiru-reviews:latest
+    container_name: bankiru-api
+    restart: unless-stopped
+    <<: *env_file
+    command: ["python", "-m", "bankiru.api"]
+    ports:
+      - "${API_PORT:-1706}:${API_PORT:-1706}"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - |
+          import os, sys, urllib.request
+          port = os.environ.get("API_PORT", "1706")
+          try:
+              r = urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2)
+              sys.exit(0 if r.status == 200 else 1)
+          except Exception:
+              sys.exit(1)
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      # First deploy creates B-tree indexes on scalar columns (one-time);
+      # subsequent restarts are instant (IF NOT EXISTS).  120 s is enough
+      # for the four lightweight column indexes.
+      start_period: 120s
+
+  parser:
+    image: bankiru-reviews:latest
+    container_name: bankiru-parser
+    restart: unless-stopped
+    <<: *env_file
+    command: ["python", "-m", "bankiru.parser"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+  ui:
+    image: bankiru-reviews:latest
+    container_name: bankiru-ui
+    restart: unless-stopped
+    <<: *env_file
+    command: ["python", "-m", "bankiru.ui"]
+    # Bind to loopback only; the host's Nginx vhost terminates TLS and
+    # proxies to this port. Do NOT publish to 0.0.0.0 — the Gradio UI is
+    # gated only by application-layer OIDC and must not be exposed
+    # directly to the public internet.
+    ports:
+      - "127.0.0.1:${UI_PORT:-17060}:${UI_PORT:-17060}"
+    depends_on:
+      api:
+        condition: service_healthy
