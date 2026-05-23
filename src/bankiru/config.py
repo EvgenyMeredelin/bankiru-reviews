@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     OBS_SECRET_KEY: str
     OBS_REGION: str
     OBS_ENDPOINT: str
+    OBS_BACKUP_PREFIX: str = "bankiru-reviews"
 
     # API
     API_PORT: int = 1706

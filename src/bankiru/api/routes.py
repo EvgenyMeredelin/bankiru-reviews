@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 from datetime import date, datetime, time
 from typing import Annotated
 
 import logfire
-from fastapi import APIRouter, Depends, Query, Response as HTTPResponse, status
+import pandas as pd
+from aiobotocore.client import AioBaseClient
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import delete, func, insert, or_, select, text
 from starlette.responses import RedirectResponse
 
@@ -25,12 +29,43 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-backup_request = Request(isBackup=True)
-
-
 @router.get("/", include_in_schema=False)
 async def redirect_from_root_to_docs():
     return RedirectResponse(url="/docs")
+
+
+async def _backup_daily_batch(
+    rows: list[dict],
+    client: AioBaseClient,
+) -> None:
+    """Serialize the POSTed batch to Parquet and upload to S3.
+
+    *rows* is the same ``list[dict]`` already prepared for the bulk INSERT,
+    so no extra ``model_dump()`` call is needed.  Parquet serialization is
+    CPU-bound and is offloaded to a thread to keep ``/healthz`` responsive.
+    """
+    settings = get_settings()
+
+    def _serialize() -> tuple[io.BytesIO, str]:
+        df = pd.DataFrame.from_records(rows)
+        # datePublished is already a datetime (validated by Pydantic);
+        # extract the date and pick the most common one for the filename.
+        dates = pd.to_datetime(df["datePublished"]).dt.date
+        backup_date = dates.mode().iloc[0] if not dates.empty else date.today()
+        buf = io.BytesIO()
+        df.to_parquet(buf, index=False)
+        buf.seek(0)
+        return buf, backup_date.isoformat()
+
+    buf, date_str = await asyncio.to_thread(_serialize)
+
+    key = f"{settings.OBS_BACKUP_PREFIX}/bankiru-reviews-{date_str}.parquet"
+    await client.put_object(
+        Bucket=settings.OBS_BUCKET,
+        Key=key,
+        Body=buf,
+        ContentType="application/vnd.apache.parquet",
+    )
 
 
 @router.post(
@@ -55,8 +90,8 @@ async def post_reviews(
         await session.execute(insert(Review), rows)
         await session.commit()
 
-    with logfire.span("Make a database backup"):
-        await get_reviews(backup_request, session, client)
+    with logfire.span("Backup daily batch to S3"):
+        await _backup_daily_batch(rows, client)
 
 
 @router.get("/reviews")
@@ -95,11 +130,8 @@ async def get_reviews(
             )
 
         handler_class = available_output_formats[r.outputFormat]
-        handler = handler_class(scalars, client, r.isBackup)
+        handler = handler_class(scalars, client)
         await handler.upload_contents()
-
-        if r.isBackup:
-            return HTTPResponse(status_code=status.HTTP_204_NO_CONTENT)
 
         url = await handler.generate_url()
         model_name = r.cloudModel or get_settings().DEFAULT_CLOUD_MODEL
@@ -121,15 +153,11 @@ async def get_reviews(
 async def delete_reviews(
     delete_ids: list[int],
     session: DBSession,
-    client: BotoClient,
 ):
     with logfire.span("Delete entries and commit"):
         statement = delete(Review).where(Review.id.in_(delete_ids))
         await session.execute(statement)
         await session.commit()
-
-    with logfire.span("Make a database backup"):
-        await get_reviews(backup_request, session, client)
 
 
 @router.delete(
@@ -141,7 +169,6 @@ async def delete_reviews_by_date(
     start_date: Annotated[date, Query(alias="startDate")],
     end_date: Annotated[date, Query(alias="endDate")],
     session: DBSession,
-    client: BotoClient,
 ):
     with logfire.span("Delete entries by date range and commit"):
         # Use datetime boundaries instead of cast(… Date) so the index
@@ -159,10 +186,6 @@ async def delete_reviews_by_date(
         deleted=deleted, start=str(start_date), end=str(end_date),
     )
 
-    if deleted:
-        with logfire.span("Make a database backup"):
-            await get_reviews(backup_request, session, client)
-
 
 @router.delete(
     "/reviews/duplicates",
@@ -170,7 +193,6 @@ async def delete_reviews_by_date(
 )
 async def delete_duplicate_reviews(
     session: DBSession,
-    client: BotoClient,
 ):
     with logfire.span("Delete duplicate entries"):
         # The CTE + md5 dedup does a full sequential scan with
@@ -202,9 +224,5 @@ async def delete_duplicate_reviews(
         await session.commit()
 
     logfire.info("deduplicated: {deleted} rows removed", deleted=deleted)
-
-    if deleted:
-        with logfire.span("Make a database backup"):
-            await get_reviews(backup_request, session, client)
 
     return {"deleted": deleted}

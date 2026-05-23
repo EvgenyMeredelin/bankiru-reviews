@@ -73,11 +73,11 @@ flowchart TD
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Every write also triggers an automatic full-table Parquet backup to S3. |
+| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
 | `parser` | Same image, `command: python -m bankiru.parser` | APScheduler cron job. Crawls banki.ru once daily, collects negative reviews for the previous `PARSER_DAYS` days, and POSTs the deduplicated batch to the `api`. |
 | `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
 | External: Postgres | (managed elsewhere) | Sole persistent data store. One table: `bankiru.reviews`. Schema is created automatically at `api` startup via `Base.metadata.create_all`. |
-| External: S3 / OBS | (managed elsewhere) | Stores named export files (pre-signed 1-hour URLs) and the rolling Parquet backup (`bankiru_reviews_db_backup.parquet`). |
+| External: S3 / OBS | (managed elsewhere) | Stores named export files (pre-signed 1-hour URLs) and daily Parquet backups (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`). |
 | External: Authentik | `https://uva-advanced.ru` | OIDC identity provider for the UI login flow. |
 | External: Infisical | `https://infisical.uva-advanced.ru` | Secrets store; `scripts/start.sh` pulls secrets into `/dev/shm` at boot. |
 
@@ -140,7 +140,7 @@ No auth. Returns `{"status": "ok"}`. Used by Docker's `healthcheck`.
 ]
 ```
 
-Inserts all rows, commits, then triggers an automatic Parquet backup of the full table to S3 (same code path as `GET /reviews?isBackup=true`). Returns `201 Created` with no body.
+Inserts all rows, commits, then uploads the batch as a daily Parquet backup (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) to S3. Returns `201 Created` with no body.
 
 ### `GET /reviews` — filter, export, and summarize
 
@@ -157,7 +157,6 @@ Inserts all rows, commits, then triggers an automatic Parquet backup of the full
 | `product` | repeatable string | Exact match on `product`. |
 | `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | Default: `parquet`. |
 | `cloudModel` | string | Override the summarization model. Default: `DEFAULT_CLOUD_MODEL`. |
-| `isBackup` | bool | Internal flag — forces a Parquet backup and returns `204 No Content` with no signed URL. Triggered automatically by write operations; do not use directly. |
 
 **Successful response** (JSON):
 
@@ -182,7 +181,7 @@ Inserts all rows, commits, then triggers an automatic Parquet backup of the full
 
 **Auth:** `API-Token` header.
 
-**Body:** JSON array of integer IDs, e.g. `[42, 43, 44]`. Deletes the matching rows, commits, then triggers an automatic Parquet backup.
+**Body:** JSON array of integer IDs, e.g. `[42, 43, 44]`. Deletes the matching rows and commits.
 
 Returns `204 No Content`.
 
@@ -197,7 +196,7 @@ Returns `204 No Content`.
 | `startDate` | `YYYY-MM-DD` | Delete reviews published on or after this date (inclusive). |
 | `endDate` | `YYYY-MM-DD` | Delete reviews published on or before this date (inclusive). |
 
-Deletes all matching rows, commits, then triggers an automatic Parquet backup (if any rows were deleted).
+Deletes all matching rows and commits.
 
 Returns `204 No Content`.
 
@@ -212,7 +211,7 @@ curl -s -X DELETE -H "API-Token: $API_TOKEN" \
 
 **Auth:** `API-Token` header.
 
-Keeps the row with the lowest `id` per `(reviewBody, product)` pair (grouped by `md5(reviewBody)` to keep the hash table small). Deletes everything else. The query uses a CTE to materialise keeper IDs first, then performs an integer-only `NOT IN` delete. Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. A per-statement timeout of 300 s is set so a slow query surfaces as an error instead of hanging indefinitely. If any rows were deleted, triggers an automatic Parquet backup.
+Keeps the row with the lowest `id` per `(reviewBody, product)` pair (grouped by `md5(reviewBody)` to keep the hash table small). Deletes everything else. The query uses a CTE to materialise keeper IDs first, then performs an integer-only `NOT IN` delete. Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. A per-statement timeout of 300 s is set so a slow query surfaces as an error instead of hanging indefinitely.
 
 **Response** (JSON): `{"deleted": <count>}`.
 
@@ -235,7 +234,7 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 **Registration is automatic.** `schemas.py` discovers all `*Maker` classes via `inspect.getmembers(handlers)` and builds `available_output_formats = {cls.extension: cls}`. Adding a new format means writing a subclass — no other file needs to change.
 
-**Backup key:** `bankiru_reviews_db_backup.<extension>` (always Parquet). Named export keys: `<uuid4>.<extension>`.
+**Backup key:** `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet` (daily batch, uploaded on POST). Named export keys: `<uuid4>.<extension>`.
 
 **XLSX specifics:** Rows are colour-coded by review URL (alternating mint/pink per distinct URL) to visually group rows that belong to the same review. `reviewBody` is excluded from auto-fit. The `datePublished` column format (`YYYY-MM-DD HH:mm:ss`) is stamped directly via openpyxl after writing, because StyleFrame's per-row style merge is unreliable for `date_time_format`.
 
@@ -359,7 +358,7 @@ Actual run time is 0.5–1.5 hours because many products have only 1–2 listing
 
 ### POST batch delivery
 
-After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate the full-table Parquet backup that the API runs after every insert. The POST retries **indefinitely** with exponential back-off capped at 60 s — after spending hours crawling, losing the batch to a transient API outage would be wasteful.
+After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate the daily Parquet backup that the API uploads after every insert. The POST retries **indefinitely** with exponential back-off capped at 60 s — after spending hours crawling, losing the batch to a transient API outage would be wasteful.
 
 ### Other implementation details
 
@@ -578,6 +577,7 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOGFIRE_TOKEN` | `None` | Logfire ingestion token. Omit for local dev (no-op). |
+| `OBS_BACKUP_PREFIX` | `bankiru-reviews` | S3 key prefix (subfolder) for daily Parquet backups. Files are written as `{prefix}/bankiru-reviews-YYYY-MM-DD.parquet`. |
 | `API_PORT` | `1706` | API listen port. If changed, also update `CREATE_REVIEWS_ENDPOINT` and `GET_REVIEWS_URL`. |
 | `UI_PORT` | `17060` | UI listen port (bound to `127.0.0.1` on the host). |
 | `CREATE_REVIEWS_ENDPOINT` | `http://api:1706/reviews` | Where the parser POSTs batches. |
@@ -730,8 +730,8 @@ curl -s -X DELETE -H "API-Token: $API_TOKEN" http://localhost:1706/reviews/dupli
 # Postgres backup (external DB)
 pg_dump "$POSTGRES_URL" --no-owner --no-acl | gzip > backup-$(date +%F).sql.gz
 
-# S3 backup is automatic — every POST /reviews and DELETE /reviews
-# rewrites the full table as bankiru_reviews_db_backup.parquet in the OBS bucket.
+# S3 backup is automatic — every POST /reviews uploads the daily batch
+# as bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet in the OBS bucket.
 ```
 
 ### Changing the daily crawl schedule
@@ -797,7 +797,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 - Стратегия запросов — намеренно простая и последовательная: один запрос за раз, случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Непредсказуемый тайминг имитирует поведение пользователя. Раздельные таймауты на соединение и чтение. Ошибки соединения (вероятный бан WAF) ретраятся бесконечно с экспоненциальным back-off. HTTP/2 отключён (WAF banki.ru блокирует ALPN `h2`).
 - API предоставляет четыре эндпоинта: `POST /reviews` (приём от парсера, требует `API-Token`), `GET /reviews` (фильтрация и выгрузка, публичный), `DELETE /reviews` (удаление по ID, требует `API-Token`), `DELETE /reviews/duplicates` (дедупликация по `reviewBody` + `product`, требует `API-Token`).
 - Поддерживаются фильтры по диапазону дат, банкам (точное совпадение), банковским услугам (точное совпадение) и городам авторов жалоб (префиксный поиск через `startswith`).
-- Поддерживаются форматы выгрузки `csv`, `json`, `parquet` и `xlsx`; ссылка на скачивание возвращается в виде pre-signed URL объектного хранилища. После каждого добавления или удаления записей API автоматически перезаписывает резервную копию всей базы (`bankiru_reviews_db_backup.parquet`) в объектном хранилище.
+- Поддерживаются форматы выгрузки `csv`, `json`, `parquet` и `xlsx`; ссылка на скачивание возвращается в виде pre-signed URL объектного хранилища. После каждого добавления записей (POST от парсера) API автоматически сохраняет ежедневную резервную копию собранного пакета (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) в объектном хранилище.
 - Суммаризация выполняется LLM-моделью (Cloud.ru Foundation Models, OpenAI-совместимый протокол) по схеме map-reduce: пользователь получает связное резюме при любом количестве отзывов. Результат — всегда строка; ошибки провайдера отображаются как текст.
 - Веб-интерфейс реализован на Gradio; работает поверх FastAPI. Кнопка «Download reviews» открывает pre-signed URL в новой вкладке браузера — файл скачивается напрямую из OBS без промежуточного сервера. Кнопка «Download summary» сохраняет содержимое панели Summary в виде `.md`-файла (клиентский Blob, без обращения к серверу).
 - Авторизация — через Authentik (OIDC) с фиксированным `redirect_uri`, корректным RP-initiated logout и заголовками безопасности (HSTS, X-Frame-Options, Referrer-Policy) на уровне Nginx.

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import inspect
 from datetime import date, datetime
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 
 from bankiru.api import handlers
 
@@ -47,7 +47,6 @@ class Request(BaseModel):
     product: list[str] | None = None
     outputFormat: outputFormats = "parquet"  # type: ignore[assignment]
     cloudModel: str | None = None
-    isBackup: Annotated[bool, Field(exclude=True)] = False
 
     @field_validator("startDate", "endDate", mode="before")
     @classmethod

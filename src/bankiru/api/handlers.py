@@ -2,8 +2,8 @@
 
 Serialization (``body`` property) is CPU-bound and runs in a thread pool
 via ``asyncio.to_thread`` so it does not block the event loop.  This keeps
-the ``/healthz`` endpoint responsive during large Parquet backups and
-prevents Docker from restarting the API container on a healthcheck timeout.
+the ``/healthz`` endpoint responsive during large exports and prevents
+Docker from restarting the API container on a healthcheck timeout.
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ class ScalarsHandler(ABC):
         self,
         scalars: list[Review],
         botoclient: AioBaseClient,
-        is_backup: bool,
     ) -> None:
         with logfire.span("Make a dataframe from the scalars"):
             records = [
@@ -49,7 +48,6 @@ class ScalarsHandler(ABC):
 
         with logfire.span("Set the rest of the attributes"):
             self.client = botoclient
-            self.is_backup = is_backup
             self._body = io.BytesIO()
 
     @property
@@ -66,8 +64,7 @@ class ScalarsHandler(ABC):
 
     @cached_property
     def key(self) -> str:
-        name = "bankiru_reviews_db_backup" if self.is_backup else uuid4()
-        return f"{name}.{self.extension}"
+        return f"{uuid4()}.{self.extension}"
 
     def _build_body(self) -> None:
         """Trigger the ``@cached_property`` body serialization (CPU-bound)."""
