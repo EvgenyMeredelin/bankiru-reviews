@@ -38,10 +38,14 @@ services:
               sys.exit(1)
       interval: 30s
       timeout: 3s
-      retries: 5
+      retries: 10
       # First deploy creates B-tree indexes on scalar columns (one-time);
       # subsequent restarts are instant (IF NOT EXISTS).  120 s is enough
       # for the four lightweight column indexes.
+      # retries=10 (was 5): the API may be unresponsive during long S3
+      # uploads or LLM summarization calls triggered by POST /reviews.
+      # 10 × 30 s = 300 s of tolerance before Docker restarts the
+      # container, matching the 300 s statement_timeout on the DB side.
       start_period: 120s
 
   parser:

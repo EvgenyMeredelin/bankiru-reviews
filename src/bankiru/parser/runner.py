@@ -15,6 +15,11 @@ from bankiru.parser.crawler import BankiruCrawler
 
 logger = logging.getLogger("bankiru.parser.runner")
 
+# Healthcheck polling: wait up to _HEALTHZ_ATTEMPTS × _HEALTHZ_INTERVAL seconds
+# for the API to become ready before starting the POST retry loop.
+_HEALTHZ_ATTEMPTS = 30
+_HEALTHZ_INTERVAL = 5.0  # seconds between polls
+
 
 async def run_once(
     *,
@@ -67,8 +72,44 @@ async def run_once(
         await _post_with_retry(settings.CREATE_REVIEWS_ENDPOINT, reviews, settings.API_TOKEN)
 
 
+async def _wait_for_api(http: httpx.AsyncClient, endpoint: str) -> None:
+    """Poll the API healthcheck until it responds 200.
+
+    Derives the ``/healthz`` URL from the reviews *endpoint* (e.g.
+    ``http://api:1706/reviews`` → ``http://api:1706/healthz``).  Waits up
+    to ``_HEALTHZ_ATTEMPTS × _HEALTHZ_INTERVAL`` seconds (default 150 s)
+    before giving up — the POST retry loop will handle any remaining
+    unavailability.
+    """
+    base = endpoint.rsplit("/", 1)[0]  # "http://api:1706"
+    healthz_url = f"{base}/healthz"
+
+    for i in range(1, _HEALTHZ_ATTEMPTS + 1):
+        try:
+            resp = await http.get(healthz_url, timeout=5.0)
+            if resp.status_code == 200:
+                logfire.info("API ready (healthz ok on poll {i})", i=i)
+                return
+        except httpx.HTTPError:
+            pass
+        logfire.info(
+            "waiting for API ({i}/{total})…",
+            i=i, total=_HEALTHZ_ATTEMPTS,
+        )
+        await asyncio.sleep(_HEALTHZ_INTERVAL)
+
+    logfire.warning(
+        "API did not become ready after {n} polls; proceeding with POST retries",
+        n=_HEALTHZ_ATTEMPTS,
+    )
+
+
 async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> None:
     """POST the batch to the API with unlimited retries.
+
+    Before the first POST attempt the function polls ``GET /healthz`` to
+    wait for the API to be ready (handles the case where the API container
+    restarted during the crawl).
 
     After spending hours crawling, losing the batch to a transient API outage
     would be wasteful.  The retry loop mirrors the crawl client's philosophy:
@@ -77,6 +118,9 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
     """
     headers = {"API-Token": token}
     async with httpx.AsyncClient(timeout=600.0) as http:
+        # Wait for the API to be healthy before attempting the POST.
+        await _wait_for_api(http, endpoint)
+
         attempt = 0
         while True:
             attempt += 1
