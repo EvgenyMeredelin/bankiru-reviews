@@ -13,6 +13,14 @@
   <a href="https://infisical.com/">Infisical</a> instance into tmpfs.
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/banki.ru-reviews-00a859?style=flat-square" alt="banki-ru">
+  <img src="https://img.shields.io/badge/cloud.ru-Advanced-1a73e8?style=flat-square" alt="cloud-ru">
+  <img src="https://img.shields.io/badge/gradio-UI-f97316?style=flat-square&logo=gradio&logoColor=white" alt="gradio">
+  <img src="https://img.shields.io/badge/fastapi-API-009688?style=flat-square&logo=fastapi&logoColor=white" alt="fastapi">
+  <img src="https://img.shields.io/badge/apscheduler-cron-4051b5?style=flat-square" alt="apscheduler">
+</p>
+
 ---
 
 ## Table of contents
