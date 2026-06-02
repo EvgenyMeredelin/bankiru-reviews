@@ -33,6 +33,7 @@
 - [Parser — crawl mechanics](#parser--crawl-mechanics)
 - [Parser — request pacing and retry](#parser--request-pacing-and-retry)
 - [Summarization — map-reduce pipeline](#summarization--map-reduce-pipeline)
+- [Semantic search](#semantic-search)
 - [UI and authentication](#ui-and-authentication)
 - [Security hardening](#security-hardening)
 - [Repository layout](#repository-layout)
@@ -84,7 +85,7 @@ flowchart TD
 | `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
 | `parser` | Same image, `command: python -m bankiru.parser` | APScheduler cron job. Crawls banki.ru once daily, collects negative reviews for the previous `PARSER_DAYS` days, and POSTs the deduplicated batch to the `api`. |
 | `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
-| External: Postgres | (managed elsewhere) | Sole persistent data store. One table: `bankiru.reviews`. Schema is created automatically at `api` startup via `Base.metadata.create_all`. |
+| External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is created automatically at `api` startup via `Base.metadata.create_all`. |
 | External: S3 / OBS | (managed elsewhere) | Stores named export files (pre-signed 1-hour URLs) and daily Parquet backups (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`). |
 | External: Authentik | `https://uva-advanced.ru` | OIDC identity provider for the UI login flow. |
 | External: Infisical | `https://infisical.uva-advanced.ru` | Secrets store; `scripts/start.sh` pulls secrets into `/dev/shm` at boot. |
@@ -95,7 +96,7 @@ flowchart TD
 
 ## Data model
 
-One table: `bankiru.reviews` (PostgreSQL schema `bankiru`).
+Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -118,6 +119,20 @@ One table: `bankiru.reviews` (PostgreSQL schema `bankiru`).
 | `ix_reviews_location` | `location` | Location prefix filter in `GET /reviews`. |
 
 **Deduplication keys:** `(reviewBody, product)` — compared via `md5(reviewBody)` to keep the hash table small (32-byte strings vs full review bodies). Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. MD5 collisions on natural-language texts are negligible. The crawler deduplicates in-memory before POSTing. The `DELETE /reviews/duplicates` endpoint deduplicates the database table in place (keeps the row with the lowest `id`).
+
+### Embeddings table: `bankiru.review_embeddings`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `review_id` | `INTEGER` PK, FK → `reviews.id` | Foreign key with `ON DELETE CASCADE`. |
+| `embedding` | `vector(1024)` | BAAI/bge-m3 embedding of the review's `reviewBody` text. |
+
+**Index:**
+
+| Index | Type | Purpose |
+|-------|------|---------|
+| PK | B-tree | Primary key on `review_id`. |
+| `ix_review_embeddings_hnsw` | HNSW (`vector_cosine_ops`, m=16, ef_construction=200) | Approximate nearest neighbor search for semantic queries. |
 
 ---
 
@@ -163,6 +178,7 @@ Inserts all rows, commits, then uploads the batch as a daily Parquet backup (`ba
 | `bankName` | repeatable string | Include only these bank names. Multiple values: `?bankName=Сбербанк&bankName=ВТБ`. Exact match. |
 | `location` | repeatable string | Include only reviews whose `location` starts with one of the given prefixes. Useful for matching a city when the stored value includes district suffixes. |
 | `product` | repeatable string | Exact match on `product`. |
+| `keywords` | `string` | Free-text semantic search. When provided, reviews are ranked by cosine similarity to the embedded query (via BAAI/bge-m3) and capped at `SEMANTIC_SEARCH_LIMIT` (default 200). Combinable with all other filters. |
 | `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | Default: `parquet`. |
 | `cloudModel` | string | Override the summarization model. Default: `DEFAULT_CLOUD_MODEL`. |
 
@@ -175,6 +191,7 @@ Inserts all rows, commits, then uploads the batch as a daily Parquet backup (`ba
   "bankName": ["Сбербанк"],
   "product": null,
   "location": null,
+  "keywords": null,
   "outputFormat": "xlsx",
   "cloudModel": "anthropic/claude-sonnet-4.6",
   "filename": "a1b2c3d4-….xlsx",
@@ -420,6 +437,65 @@ The `// 4` cap prevents a small-context model (e.g. 4 k tokens) with a large `OU
 
 ---
 
+## Semantic search
+
+The Keywords field in the UI enables semantic (vector) search over review texts. When keywords are provided, the system:
+
+1. Embeds the query text using **BAAI/bge-m3** (1024-dim, multilingual) via the Cloud.ru Foundation Models `/v1/embeddings` endpoint.
+2. JOINs `bankiru.reviews` with `bankiru.review_embeddings` and applies all scalar filters (date range, bank, product, location).
+3. Ranks the filtered results by cosine distance to the query vector using pgvector's HNSW index.
+4. Returns the top `SEMANTIC_SEARCH_LIMIT` (default 200) most relevant reviews.
+
+When no keywords are provided, the query path is unchanged — all matching reviews are returned without vector ranking.
+
+### Embedding pipeline
+
+- **New reviews:** Embedded inline during `POST /reviews`. If embedding fails, the review is saved without an embedding and will be backfilled later.
+- **Startup backfill:** At API startup, a background task embeds any reviews that don't yet have embeddings.
+- **Reindex CLI:** `python -m bankiru.embedder reindex --confirm` regenerates all embeddings from scratch (required after swapping the embedding model).
+
+### Reindexing
+
+```bash
+# Dry-run — show what would happen
+docker exec bankiru-api python -m bankiru.embedder reindex
+
+# Full reindex — TRUNCATE + re-embed all reviews
+docker exec bankiru-api python -m bankiru.embedder reindex --confirm
+
+# Backfill only — embed reviews missing embeddings
+docker exec bankiru-api python -m bankiru.embedder backfill
+```
+
+### Pre-deploy checklist
+
+1. **Enable pgvector on Cloud.ru RDS:**
+   - Go to RDS console → instance → Plugins
+   - Enable the `vector 0.8.0` plugin
+   - Restart the instance if required by the plugin activation
+   - Verify: `SELECT extversion FROM pg_extension WHERE extname = 'vector';`
+
+2. **Configure Infisical secrets:**
+   - Set `EMBEDDINGS_API_KEY` (or reuse `OPENAI_API_KEY` — the embedder falls back automatically)
+   - Optionally set `EMBEDDINGS_BASE_URL` and `EMBEDDINGS_MODEL` if different from defaults
+
+3. **Deploy:**
+   ```bash
+   git checkout semantic-search
+   docker compose build
+   docker compose up -d
+   ```
+
+4. **Monitor the backfill:**
+   ```bash
+   docker logs bankiru-api -f
+   ```
+   The API auto-creates the `review_embeddings` table and starts backfilling ~380K reviews.
+   Progress is logged every batch (~500 reviews). Expect ~63 minutes for the initial backfill.
+   Subsequent restarts skip the backfill (all rows already embedded).
+
+---
+
 ## UI and authentication
 
 The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application inside a FastAPI app. The FastAPI layer handles OIDC; the Gradio layer handles the review query form.
@@ -445,7 +521,8 @@ The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application ins
 | Start / End | DateTime | Date range filter (no time component). |
 | Bank | Multi-select dropdown | 50 banks pre-loaded in `choices.py` (top-50 by complaint volume 2025). Default: `Сбербанк`. |
 | Product | Multi-select dropdown | 23 banking product labels matching the parser's product catalog. |
-| Location | Multi-select dropdown | 82 Russian regional capitals. Uses `startswith` matching on the server side. |
+| Location | Multi-select dropdown | 88 Russian regional capitals. Uses `startswith` matching on the server side. |
+| Keywords | Textbox | Free-text semantic search query. When provided, reviews are ranked by cosine similarity to the embedded query and capped at `SEMANTIC_SEARCH_LIMIT`. |
 | Format | Single-select dropdown | `csv`, `json`, `parquet`, `xlsx`. Default: `parquet`. |
 | Cloud model | Single-select dropdown | Populated from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. |
 | Submit | Button | Calls `GET /reviews`, populates the Summary panel and stores the signed URL. |
@@ -514,10 +591,10 @@ bankiru-reviews/
     ├── config.py                   # Pydantic Settings; all env vars in one place
     ├── logging.py                  # configure_logfire() + install_auto_tracing()
     ├── db.py                       # async SQLAlchemy engine, session factory, create_all; statement_timeout
-    ├── models.py                   # Review ORM (schema="bankiru"); indexes; review_columns list
+    ├── models.py                   # Review + ReviewEmbedding ORM (schema="bankiru"); indexes; review_columns list
     ├── api/
     │   ├── __main__.py             # uvicorn entry; auto-traces api.routes + api.handlers
-    │   ├── app.py                  # FastAPI factory; lifespan runs create_all_tables
+    │   ├── app.py                  # FastAPI factory; lifespan runs create_all_tables + backfill_embeddings
     │   ├── routes.py               # GET/POST/DELETE /reviews; GET /healthz
     │   ├── deps.py                 # DBSession, BotoClient, api_token type aliases
     │   ├── schemas.py              # Pydantic Request / Response / Review; format registry
@@ -525,6 +602,9 @@ bankiru-reviews/
     │   ├── summarizer.py           # summarize_map_reduce; tiktoken chunker; pydantic_ai
     │   ├── model_catalog.py        # Cloud.ru /models TTL cache; get_model_context()
     │   └── botocore_client.py      # aiobotocore async S3 client factory
+    ├── embedder/
+    │   ├── __init__.py             # embed_texts(), backfill_embeddings(), reindex_embeddings()
+    │   └── __main__.py             # CLI: python -m bankiru.embedder {backfill,reindex}
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
     │   ├── runner.py               # run_once(days=N); POST with unlimited retry
@@ -612,6 +692,13 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | `OIDC_DISCOVERY_URL` | Authentik well-known URL | OIDC discovery document endpoint. |
 | `OIDC_REDIRECT_URI` | `None` (falls back to `url_for`) | Must exactly match the Redirect URI registered in Authentik. Set in production. |
 | `OIDC_POST_LOGOUT_URI` | `None` (falls back to `/`) | Must exactly match a Post-Logout Redirect URI in Authentik. |
+| `EMBEDDINGS_API_KEY` | `None` | Cloud.ru API key for embeddings. Falls back to `OPENAI_API_KEY` if not set. |
+| `EMBEDDINGS_BASE_URL` | `None` | Base URL for the embeddings endpoint. Falls back to `OPENAI_BASE_URL` if not set. |
+| `EMBEDDINGS_MODEL` | `BAAI/bge-m3` | Embedding model name. Default: `BAAI/bge-m3`. |
+| `EMBEDDINGS_DIMENSIONS` | `1024` | Vector dimensions. Default: `1024`. |
+| `EMBEDDINGS_BATCH_SIZE` | `50` | Texts per API call. Default: `50`. |
+| `EMBEDDINGS_BACKFILL_BATCH` | `500` | DB rows per backfill iteration. Default: `500`. |
+| `SEMANTIC_SEARCH_LIMIT` | `200` | Max results when Keywords field is used. Default: `200`. |
 | `AWS_REQUEST_CHECKSUM_CALCULATION` | `when_required` | Botocore compat flag for non-AWS S3. Set in environment, not as a Pydantic field. |
 | `AWS_RESPONSE_CHECKSUM_VALIDATION` | `when_required` | Same. |
 
@@ -803,7 +890,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 - Назначение системы — централизованный мониторинг негативных отзывов и претензий к российским банкам, публикуемых на портале banki.ru (оценки 1–2 звезды).
 - Источник данных — banki.ru; рубрикатор покрывает 24 банковские услуги для физических и юридических лиц. Парсер ежедневно собирает все отзывы за истекшие `PARSER_DAYS` суток (по умолчанию 1) и пакетом отправляет их в API.
 - Стратегия запросов — намеренно простая и последовательная: один запрос за раз, случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Непредсказуемый тайминг имитирует поведение пользователя. Раздельные таймауты на соединение и чтение. Ошибки соединения (вероятный бан WAF) ретраятся бесконечно с экспоненциальным back-off. HTTP/2 отключён (WAF banki.ru блокирует ALPN `h2`).
-- API предоставляет четыре эндпоинта: `POST /reviews` (приём от парсера, требует `API-Token`), `GET /reviews` (фильтрация и выгрузка, публичный), `DELETE /reviews` (удаление по ID, требует `API-Token`), `DELETE /reviews/duplicates` (дедупликация по `reviewBody` + `product`, требует `API-Token`).
+- API предоставляет пять эндпоинтов: `POST /reviews` (приём от парсера, требует `API-Token`), `GET /reviews` (фильтрация и выгрузка, публичный), `DELETE /reviews` (удаление по ID, требует `API-Token`), `DELETE /reviews/by-date` (удаление по диапазону дат, требует `API-Token`), `DELETE /reviews/duplicates` (дедупликация по `reviewBody` + `product`, требует `API-Token`).
 - Поддерживаются фильтры по диапазону дат, банкам (точное совпадение), банковским услугам (точное совпадение) и городам авторов жалоб (префиксный поиск через `startswith`).
 - Поддерживаются форматы выгрузки `csv`, `json`, `parquet` и `xlsx`; ссылка на скачивание возвращается в виде pre-signed URL объектного хранилища. После каждого добавления записей (POST от парсера) API автоматически сохраняет ежедневную резервную копию собранного пакета (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) в объектном хранилище.
 - Суммаризация выполняется LLM-моделью (Cloud.ru Foundation Models, OpenAI-совместимый протокол) по схеме map-reduce: пользователь получает связное резюме при любом количестве отзывов. Результат — всегда строка; ошибки провайдера отображаются как текст.

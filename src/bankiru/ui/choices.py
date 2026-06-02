@@ -1,6 +1,28 @@
-"""Static dropdown choices for the Gradio UI: locations, banks, products, file formats."""
+"""Static dropdown choices for the Gradio UI: locations, banks, products, file formats.
 
-# административные центры субъектов РФ
+This module contains hardcoded lists used to populate the multi-select dropdown
+components in the Gradio UI (blocks.py). The lists are static because:
+  - Locations: administrative capitals of Russian federal subjects (stable)
+  - Banks: top-50 banks by complaint volume in 2025 (updated annually)
+  - Products: banking product categories matching the parser's PRODUCTS dict
+  - File formats: supported export formats matching the API's handler classes
+
+These lists are intentionally separate from the parser's PRODUCTS dict
+(settings.py) because:
+  - The parser uses URL slugs as keys; the UI needs human-readable labels
+  - The UI may show a subset of products or banks
+  - The location list is UI-only (the parser doesn't filter by location)
+
+Connection to other modules:
+  - bankiru.ui.blocks — imports BANKS, PRODUCTS, LOCATIONS, FILE_FORMATS
+                        for the Gradio dropdown components
+"""
+
+# ── Locations ────────────────────────────────────────────────────────────────
+# Administrative capitals of Russian federal subjects (субъекты РФ).
+# Used for the Location filter dropdown. The API matches these as prefixes
+# (startswith), so "Москва" matches "Москва", "Москва, район Хамовники", etc.
+# Sorted alphabetically in Russian.
 LOCATIONS = [
     "Абакан",
     "Анадырь",
@@ -92,7 +114,11 @@ LOCATIONS = [
     "Ярославль"
 ]
 
-# топ-50 по количеству жалоб за 2025 г. в алфавитном порядке
+# ── Banks ────────────────────────────────────────────────────────────────────
+# Top-50 Russian banks by complaint volume in 2025, sorted alphabetically.
+# Used for the Bank filter dropdown. The API matches these exactly (IN clause),
+# so the names must match the bankName values stored in the database (which
+# come from banki.ru's JSON-LD structured data).
 BANKS = [
     "Ozon Банк",
     "Абсолют Банк",
@@ -146,9 +172,13 @@ BANKS = [
     "Яндекс Банк"
 ]
 
-# банковские услуги
+# ── Products ─────────────────────────────────────────────────────────────────
+# Banking product categories. These labels must match the values in the
+# parser's PRODUCTS dict (settings.py) because they are stored as-is in the
+# database and matched exactly by the API's product filter (IN clause).
+# Split into retail (individuals) and business (legal entities) sections.
 PRODUCTS = [
-    # для физических лиц
+    # ── Retail banking products (for individuals) ────────────────────
     "Автокредит",
     "Вклад",
     "Дебетовая карта",
@@ -162,7 +192,7 @@ PRODUCTS = [
     "Реструктуризация/рефинансирование",
     "Другое (физические лица)",
 
-    # для юридических лиц
+    # ── Business banking products (for legal entities) ───────────────
     "Банковская гарантия",
     "Депозит",
     "Дистанционное обслуживание юридических лиц",
@@ -176,6 +206,11 @@ PRODUCTS = [
     "Другое (юридические лица)"
 ]
 
+# ── File formats ─────────────────────────────────────────────────────────────
+# Supported export formats. These must match the `extension` attribute of the
+# handler classes in bankiru.api.handlers (CSVMaker, JSONMaker, etc.).
+# The API's schemas.py auto-discovers available formats from the handlers module,
+# so this list should stay in sync with the handler classes.
 FILE_FORMATS = [
     "csv",
     "json",

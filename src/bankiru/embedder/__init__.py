@@ -1,0 +1,383 @@
+"""Embedding utilities: generate vectors via Cloud.ru and backfill the DB.
+
+This module provides three main capabilities:
+
+  1. **embed_texts()** — Core function that calls the OpenAI-compatible
+     /v1/embeddings endpoint to generate vector embeddings for a list of
+     text strings. Used by both the API (for real-time embedding of new
+     reviews and semantic search queries) and the backfill process.
+
+  2. **backfill_embeddings()** — Iterates over all reviews that don't yet
+     have an embedding and generates one for each. Called automatically
+     during API startup (as a background task in app.py) and can also be
+     run manually via ``python -m bankiru.embedder backfill``.
+
+  3. **reindex_embeddings()** — Drops all existing embeddings and rebuilds
+     them from scratch. Useful when changing the embedding model or
+     dimensions. Run via ``python -m bankiru.embedder reindex --confirm``.
+
+The embedding model (BAAI/bge-m3) produces 1024-dimensional vectors that
+are stored in the review_embeddings table (pgvector Vector(1024) column).
+These vectors enable semantic search via cosine similarity in GET /reviews.
+
+Connection to other modules:
+  - bankiru.api.routes     — calls embed_texts() for POST /reviews (new review
+                             embedding) and GET /reviews (query embedding)
+  - bankiru.api.app        — calls backfill_embeddings() as a background task
+  - bankiru.embedder.__main__ — CLI entry point for manual backfill/reindex
+  - bankiru.db             — provides _progress_bar() for visual feedback
+  - bankiru.models         — provides Review and ReviewEmbedding ORM models
+  - bankiru.config         — provides embedding API credentials and settings
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import time as _time
+from typing import TYPE_CHECKING, Callable
+
+import httpx
+import logfire
+from sqlalchemy import func, insert, select, text
+
+from bankiru.config import get_settings
+from bankiru.db import _progress_bar
+from bankiru.models import Review, ReviewEmbedding
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format *seconds* as ``Xm Ys`` or ``Xs``."""
+    m, s = divmod(int(seconds), 60)
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+# ---------------------------------------------------------------------------
+# Core embedding function
+# ---------------------------------------------------------------------------
+
+async def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Call the OpenAI-compatible ``/v1/embeddings`` endpoint in batches.
+
+    Splits the input texts into sub-batches of EMBEDDINGS_BATCH_SIZE (default 50)
+    and sends each sub-batch as a single API call. This is more efficient than
+    one-text-per-call and avoids hitting request size limits.
+
+    Returns a flat list of embedding vectors in the same order as *texts*.
+    Retries on 429 (rate limit) / 5xx (server error) up to 3 times with
+    exponential back-off.
+
+    Args:
+        texts: List of text strings to embed.
+
+    Returns:
+        List of float vectors, one per input text, in the same order.
+
+    Raises:
+        RuntimeError: If no API key is configured.
+        httpx.HTTPStatusError: If the API returns a non-retryable error.
+    """
+    settings = get_settings()
+
+    # Fall back to the general OpenAI key if no embeddings-specific key is set.
+    # This allows using a different provider/key for embeddings vs summaries.
+    api_key = settings.EMBEDDINGS_API_KEY or settings.OPENAI_API_KEY
+    if not api_key:
+        raise RuntimeError(
+            "No embeddings API key configured. "
+            "Set EMBEDDINGS_API_KEY or OPENAI_API_KEY."
+        )
+
+    # Build the embeddings endpoint URL from the base URL.
+    base_url = settings.EMBEDDINGS_BASE_URL or settings.OPENAI_BASE_URL
+    url = base_url.rstrip("/") + "/embeddings"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    batch_size = settings.EMBEDDINGS_BATCH_SIZE
+    all_embeddings: list[list[float]] = []
+
+    # Use a single httpx client for all sub-batches (connection reuse).
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for start in range(0, len(texts), batch_size):
+            sub_batch = texts[start : start + batch_size]
+            payload = {"model": settings.EMBEDDINGS_MODEL, "input": sub_batch}
+
+            resp = await _post_with_retry(client, url, headers, payload)
+            # The API may return embeddings in arbitrary order; sort by the
+            # `index` field to guarantee the output order matches the input.
+            data = sorted(resp.json()["data"], key=lambda d: d["index"])
+            all_embeddings.extend(d["embedding"] for d in data)
+
+    return all_embeddings
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    payload: dict,
+    *,
+    max_retries: int = 3,
+) -> httpx.Response:
+    """POST with exponential back-off on 429 (rate limit) / 5xx (server error).
+
+    Retries up to max_retries times with doubling backoff (1s, 2s, 4s).
+    On the final attempt, raises the HTTP error if still failing.
+    Non-retryable errors (4xx other than 429) are raised immediately.
+    """
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        resp = await client.post(url, json=payload, headers=headers)
+        # Retry on rate limit (429) or server errors (5xx).
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt == max_retries:
+                # Final attempt — raise the error to the caller.
+                resp.raise_for_status()
+            logfire.warning(
+                "Embeddings API {status} on attempt {attempt}/{max}, "
+                "retrying in {backoff:.0f}s",
+                status=resp.status_code,
+                attempt=attempt,
+                max=max_retries,
+                backoff=backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff *= 2
+            continue
+        resp.raise_for_status()
+        return resp
+    # Unreachable, but keeps mypy happy
+    raise RuntimeError("Exhausted retries")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# Backfill un-embedded reviews
+# ---------------------------------------------------------------------------
+
+async def backfill_embeddings(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> int:
+    """Embed all reviews that don't yet have a vector.
+
+    Iterates in batches of EMBEDDINGS_BACKFILL_BATCH (default 500) rows,
+    fetching un-embedded reviews via a LEFT JOIN + IS NULL pattern. Each
+    batch makes ceil(batch_size / EMBEDDINGS_BATCH_SIZE) API calls to the
+    embeddings endpoint.
+
+    Progress is logged with a visual progress bar and ETA estimate.
+    An optional progress_callback can be provided for external monitoring.
+
+    Args:
+        session_maker: Async SQLAlchemy session factory.
+        progress_callback: Optional (done, total) callback for progress tracking.
+
+    Returns:
+        Number of new embeddings created.
+    """
+    settings = get_settings()
+    batch_size = settings.EMBEDDINGS_BACKFILL_BATCH
+
+    # Count how many reviews don't have embeddings yet.
+    # LEFT JOIN + IS NULL finds reviews with no corresponding embedding row.
+    async with session_maker() as session:
+        count_result = await session.execute(
+            select(func.count())
+            .select_from(Review)
+            .outerjoin(ReviewEmbedding, ReviewEmbedding.review_id == Review.id)
+            .where(ReviewEmbedding.review_id.is_(None))
+        )
+        total = count_result.scalar_one()
+
+    if total == 0:
+        logfire.info("All reviews already embedded")
+        return 0
+
+    total_batches = math.ceil(total / batch_size)
+    logfire.info(
+        "Backfill starting: {total} un-embedded reviews in ~{batches} batches",
+        total=total,
+        batches=total_batches,
+    )
+    embedded = 0
+    batch_num = 0
+    t0 = _time.monotonic()
+
+    # Main backfill loop: fetch un-embedded reviews in batches, embed them,
+    # and insert the embeddings into the database.
+    while True:
+        # Fetch the next batch of reviews that don't have embeddings.
+        # ORDER BY id ensures deterministic pagination (always processes
+        # the oldest un-embedded reviews first).
+        async with session_maker() as session:
+            result = await session.execute(
+                select(Review.id, Review.reviewBody)
+                .outerjoin(
+                    ReviewEmbedding, ReviewEmbedding.review_id == Review.id,
+                )
+                .where(ReviewEmbedding.review_id.is_(None))
+                .order_by(Review.id)
+                .limit(batch_size)
+            )
+            rows = result.all()
+
+        if not rows:
+            # No more un-embedded reviews — backfill is complete.
+            break
+
+        batch_num += 1
+        ids = [r.id for r in rows]
+        texts = [r.reviewBody for r in rows]
+
+        try:
+            # Generate embeddings for this batch of review texts.
+            # embed_texts() handles sub-batching internally.
+            vectors = await embed_texts(texts)
+        except Exception:
+            # If embedding fails for this batch, skip it and continue.
+            # The skipped reviews will be picked up on the next backfill run.
+            logfire.warning(
+                "Batch {batch}/{batches} starting at review_id={first_id} failed, skipping",
+                batch=batch_num,
+                batches=total_batches,
+                first_id=ids[0],
+            )
+            # Sleep before continuing so we don't hammer a broken endpoint.
+            await asyncio.sleep(2.0)
+            continue
+
+        # Bulk insert the generated embeddings into the database.
+        async with session_maker() as session:
+            await session.execute(
+                insert(ReviewEmbedding).values(
+                    [
+                        {"review_id": rid, "embedding": vec}
+                        for rid, vec in zip(ids, vectors)
+                    ]
+                )
+            )
+            await session.commit()
+
+        # Update progress tracking and log with visual progress bar.
+        embedded += len(ids)
+        elapsed = _time.monotonic() - t0
+        rate = embedded / elapsed if elapsed > 0 else 0
+        eta = (total - embedded) / rate if rate > 0 else 0
+        logfire.info(
+            "{bar}  batch {batch}/{batches}  {done}/{total}  "
+            "elapsed {elapsed}  ETA {eta}",
+            bar=_progress_bar(embedded, total),
+            batch=batch_num,
+            batches=total_batches,
+            done=embedded,
+            total=total,
+            elapsed=_fmt_duration(elapsed),
+            eta=_fmt_duration(eta),
+        )
+        if progress_callback is not None:
+            progress_callback(embedded, total)
+
+        # Brief pause between batches to respect API rate limits.
+        await asyncio.sleep(0.5)
+
+    total_elapsed = _time.monotonic() - t0
+    logfire.info(
+        "Backfill complete: {embedded} new embeddings in {elapsed}",
+        embedded=embedded,
+        elapsed=_fmt_duration(total_elapsed),
+    )
+    return embedded
+
+
+# ---------------------------------------------------------------------------
+# Full reindex (drop + rebuild)
+# ---------------------------------------------------------------------------
+
+async def reindex_embeddings(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    confirm: bool = False,
+) -> None:
+    """Drop all embeddings and rebuild from scratch.
+
+    This is a destructive operation that:
+      1. TRUNCATEs the review_embeddings table (fast, no per-row overhead)
+      2. Drops the HNSW vector index (must be rebuilt after bulk insert)
+      3. Runs backfill_embeddings() to re-embed all reviews
+      4. Rebuilds the HNSW index with increased maintenance_work_mem
+
+    Without ``confirm=True`` this is a **dry-run** that only prints what
+    *would* happen. This safety mechanism prevents accidental data loss.
+
+    Use cases:
+      - Changing the embedding model (e.g. from bge-m3 to a newer model)
+      - Changing the vector dimensions
+      - Recovering from corrupted embeddings
+    """
+    # ── Dry-run: show what would happen without making changes ────────
+    if not confirm:
+        async with session_maker() as session:
+            total = (
+                await session.execute(select(func.count()).select_from(Review))
+            ).scalar_one()
+            existing = (
+                await session.execute(
+                    select(func.count()).select_from(ReviewEmbedding)
+                )
+            ).scalar_one()
+
+        logfire.info(
+            "Would reindex {total} reviews. "
+            "{existing} existing embeddings will be deleted. "
+            "Run with --confirm to proceed.",
+            total=total,
+            existing=existing,
+        )
+        return
+
+    # ── Full reindex ──────────────────────────────────────────────────
+    t0 = _time.monotonic()
+
+    # Step 1: TRUNCATE is much faster than DELETE for removing all rows
+    # (no per-row WAL logging, no trigger firing).
+    # Step 2: Drop the HNSW index before bulk insert — building the index
+    # after all data is inserted is much faster than maintaining it during
+    # incremental inserts.
+    async with session_maker() as session:
+        await session.execute(text("TRUNCATE bankiru.review_embeddings"))
+        await session.execute(
+            text("DROP INDEX IF EXISTS bankiru.ix_review_embeddings_hnsw")
+        )
+        await session.commit()
+    logfire.info("Truncated review_embeddings and dropped HNSW index")
+
+    # Step 3: Re-embed all reviews using the standard backfill function.
+    await backfill_embeddings(session_maker)
+
+    # Step 4: Rebuild the HNSW index with increased maintenance_work_mem
+    # for faster index construction. The 2GB setting allows Postgres to
+    # use more RAM during the build, significantly speeding up the process
+    # for large tables (380K+ rows).
+    async with session_maker() as session:
+        await session.execute(text("SET LOCAL maintenance_work_mem = '2GB'"))
+        await session.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_review_embeddings_hnsw "
+                "ON bankiru.review_embeddings "
+                "USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 200)"
+            )
+        )
+        await session.commit()
+
+    elapsed = _time.monotonic() - t0
+    logfire.info("Reindex complete in {elapsed:.1f}s", elapsed=elapsed)

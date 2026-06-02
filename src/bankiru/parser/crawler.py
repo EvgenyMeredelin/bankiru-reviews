@@ -37,10 +37,27 @@ from bankiru.parser.tools import clean_text_pipe
 
 
 class BankiruCrawler:
-    """Sequential crawler. One instance per run; pass it a fresh `BankiruClient`."""
+    """Sequential crawler. One instance per run; pass it a fresh `BankiruClient`.
+
+    The crawler iterates through all banking products defined in PRODUCTS
+    (settings.py), fetching listing pages and detail pages one at a time.
+    For each product, it paginates through listing pages until it either:
+      - Finds a review older than start_date (hit_left_boundary)
+      - Finds a page with no review markup (past the last page)
+
+    Collected records are deduplicated by (reviewBody, product) before
+    being returned to the caller (runner.py), which POSTs them to the API.
+    """
 
     def __init__(self, client: BankiruClient) -> None:
+        """Create a crawler with the given HTTP client.
+
+        Args:
+            client: A warmed-up BankiruClient instance (cookie jar seeded).
+        """
         self.client = client
+        # Accumulator for all review records across all products.
+        # Each record is a dict matching the API's Review schema.
         self.records: list[dict] = []
 
     async def crawl_all(
@@ -83,6 +100,15 @@ class BankiruCrawler:
         return self._deduplicated()
 
     def _deduplicated(self) -> list[dict]:
+        """Remove duplicate reviews by (reviewBody, product) combination.
+
+        Duplicates can arise because:
+          - banki.ru uses both "corporate" and "legal" slugs for the same
+            product category (see settings.py PRODUCTS dict)
+          - A review may appear on multiple listing pages during pagination
+
+        Uses pandas for efficient deduplication on large record sets.
+        """
         if not self.records:
             return []
         return (
@@ -98,27 +124,58 @@ class BankiruCrawler:
         start_date: dt.datetime,
         end_date: dt.datetime,
     ) -> None:
+        """Crawl all listing pages for a single product within the date window.
+
+        Pagination logic:
+          - Iterate pages 1, 2, 3, ... (infinite counter via itertools.count)
+          - For each page, extract review candidates within [start_date, end_date)
+          - For each candidate, fetch the detail page to get the author's city
+          - Stop when:
+            a) hit_left_boundary: found a review older than start_date
+               (reviews are sorted newest-first on banki.ru)
+            b) not any_matched: page has no review markup (past last page)
+            c) response is None: all retries exhausted for this page
+
+        Args:
+            product: URL slug for the product (e.g. "creditcards")
+            start_date: Inclusive start of the date window (naive datetime)
+            end_date: Exclusive end of the date window (naive datetime)
+        """
+        # Look up the human-readable product label (e.g. "Кредитная карта")
+        # for use in the final review record.
         product_label = PRODUCTS[product]
 
         with logfire.span("crawl product={product}", product=product):
             for page in itertools.count(1):
+                # Build the listing page URL with filters: type=all, rate=1&2
+                # (only negative reviews with ratings 1 or 2 out of 5).
                 url = PAGE_URL.format(base=BASE_URL, product=product, page=page)
                 response = await self.client.get(url, product=product)
                 if response is None:
+                    # All retries exhausted for this page — skip this product.
                     return
 
+                # Normalise whitespace and remove backslashes from the HTML.
+                # This simplifies regex matching in _extract_candidates().
                 page_text = " ".join(response.text.replace("\\", "").split())
                 candidates, hit_left_boundary, any_matched = self._extract_candidates(
                     page_text, product, product_label, url, start_date, end_date,
                 )
 
+                # Fetch the detail page for each candidate to extract the
+                # author's city (location). This is done sequentially — one
+                # request at a time through the same pacing client.
                 for candidate in candidates:
                     await self._enrich_one(candidate)
 
                 if hit_left_boundary:
+                    # Found a review older than start_date — we've passed the
+                    # left boundary of our date window. No need to paginate further.
                     return
 
                 if not any_matched:
+                    # No review markup found on this page — we've gone past
+                    # the last listing page for this product.
                     return
                 # any_matched=True but candidates=[] means all reviews on this
                 # page are newer than end_date; paginate forward to find the
@@ -149,6 +206,9 @@ class BankiruCrawler:
         hit_left_boundary = False
         any_matched = False
 
+        # Pair up content matches (JSON-LD structured data) with URL matches
+        # (review detail page links). Both regexes match in the same order
+        # on the page, so zip() correctly pairs them.
         match_pairs = zip(
             REVIEW_CONTENT_PATTERN.finditer(page_text),
             REVIEW_URL_PATTERN.finditer(page_text),
@@ -156,16 +216,25 @@ class BankiruCrawler:
 
         for content_match, url_match in match_pairs:
             any_matched = True
+            # Reconstruct the JSON-LD object from the regex capture groups.
+            # The regex captures only the parts we need (datePublished,
+            # reviewBody, itemReviewed.name), skipping author/rating fields.
             raw = json.loads("".join(content_match.groups()))
             date_published = dt.datetime.strptime(
                 raw["datePublished"], "%Y-%m-%d %H:%M:%S"
             )
+            # Reviews are sorted newest-first on banki.ru. Skip reviews
+            # newer than end_date (they're outside our window).
             if date_published >= end_date:
                 continue
+            # If we hit a review older than start_date, we've passed the
+            # left boundary — all subsequent reviews will be even older.
             if date_published < start_date:
                 hit_left_boundary = True
                 break
 
+            # Store the candidate with internal metadata (prefixed with _)
+            # that will be consumed by _enrich_one() and then discarded.
             candidates.append({
                 "_raw":         raw,
                 "_review_url":  BASE_URL + url_match.group(1),

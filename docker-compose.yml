@@ -1,3 +1,6 @@
+# ── Docker Compose project definition ───────────────────────────────────────
+# Compose project name. All containers, networks, and volumes created by
+# this file are prefixed with "bankiru-reviews".
 name: bankiru-reviews
 
 # Three services share a single image (built once from ./Dockerfile) and a
@@ -8,21 +11,43 @@ name: bankiru-reviews
 # External dependencies (Postgres + S3-compatible OBS + Authentik) are
 # NOT managed here; only api + parser + ui run in this compose project.
 
+# ── YAML anchor for the shared env file ─────────────────────────────────────
+# All three services need the same environment variables (DB credentials,
+# API tokens, OIDC secrets, etc.). This YAML anchor avoids repeating the
+# env_file path in every service block. The `<<: *env_file` merge key
+# injects it into each service.
+# The env file lives on tmpfs (/dev/shm) so secrets never touch persistent
+# storage and are automatically wiped on host reboot.
 x-env-file: &env_file
   env_file:
     - /dev/shm/bankiru-reviews-secrets/.env
 
 services:
+  # ── API service ───────────────────────────────────────────────────────────
+  # FastAPI REST service. Handles review CRUD, S3 export, LLM summarization,
+  # and embedding generation. This is the central service that both the
+  # parser and UI depend on.
   api:
+    # Build the shared image from the project root Dockerfile.
+    # Only the api service has `build:` — parser and ui reuse the same image.
     build:
       context: .
     image: bankiru-reviews:latest
     container_name: bankiru-api
+    # Restart on crash but not if the operator explicitly stops the container.
     restart: unless-stopped
+    # Inject the shared env file (secrets from Infisical via tmpfs).
     <<: *env_file
+    # Override the Dockerfile's default CMD to explicitly run the API module.
     command: ["python", "-m", "bankiru.api"]
+    # Publish the API port on all interfaces. The API is not gated by OIDC
+    # (read endpoints are public), but write endpoints require an API-Token
+    # header. The ${VAR:-default} syntax reads from the env file, falling
+    # back to 1706 if API_PORT is not set.
     ports:
       - "${API_PORT:-1706}:${API_PORT:-1706}"
+    # Docker healthcheck: a lightweight Python script that hits GET /healthz.
+    # Using Python (not curl) avoids installing curl in the slim image.
     healthcheck:
       test:
         - "CMD"
@@ -36,8 +61,13 @@ services:
               sys.exit(0 if r.status == 200 else 1)
           except Exception:
               sys.exit(1)
+      # Check every 30 seconds; each check must respond within 3 seconds.
       interval: 30s
       timeout: 3s
+      # Allow 10 consecutive failures before Docker marks the container as
+      # unhealthy and restarts it. 10 × 30 s = 300 s of tolerance, which
+      # matches the 300 s statement_timeout on the DB side. This is generous
+      # enough to survive long S3 uploads or LLM summarization calls.
       retries: 10
       # First deploy creates B-tree indexes on scalar columns (one-time);
       # subsequent restarts are instant (IF NOT EXISTS).  120 s is enough
@@ -48,28 +78,43 @@ services:
       # container, matching the 300 s statement_timeout on the DB side.
       start_period: 120s
 
+  # ── Parser service ────────────────────────────────────────────────────────
+  # APScheduler cron job that crawls banki.ru once daily, collects negative
+  # reviews, and POSTs them to the API. Runs the same image but with a
+  # different command. Does not build its own image — reuses the one built
+  # by the api service.
   parser:
     image: bankiru-reviews:latest
     container_name: bankiru-parser
     restart: unless-stopped
     <<: *env_file
     command: ["python", "-m", "bankiru.parser"]
+    # Wait for the API to be healthy before starting. This ensures the
+    # parser can POST reviews immediately after its first crawl completes.
+    # Note: this only applies at initial container start, not during
+    # runtime restarts of the API.
     depends_on:
       api:
         condition: service_healthy
 
+  # ── UI service ────────────────────────────────────────────────────────────
+  # Gradio web UI mounted inside a FastAPI app. Provides the review query
+  # form, LLM summary display, and download buttons. Protected by
+  # Authentik OIDC authentication.
   ui:
     image: bankiru-reviews:latest
     container_name: bankiru-ui
     restart: unless-stopped
     <<: *env_file
     command: ["python", "-m", "bankiru.ui"]
-    # Bind to loopback only; the host's Nginx vhost terminates TLS and
-    # proxies to this port. Do NOT publish to 0.0.0.0 — the Gradio UI is
-    # gated only by application-layer OIDC and must not be exposed
-    # directly to the public internet.
+    # Bind to loopback only (127.0.0.1); the host's Nginx vhost terminates
+    # TLS and proxies to this port. Do NOT publish to 0.0.0.0 — the Gradio
+    # UI is gated only by application-layer OIDC and must not be exposed
+    # directly to the public internet without the Nginx TLS termination.
     ports:
       - "127.0.0.1:${UI_PORT:-17060}:${UI_PORT:-17060}"
+    # Like the parser, the UI depends on the API being healthy because it
+    # calls GET /reviews on the API to fetch filtered review data.
     depends_on:
       api:
         condition: service_healthy

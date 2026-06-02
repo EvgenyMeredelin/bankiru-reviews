@@ -1,15 +1,35 @@
+# ── Git-ignored files ───────────────────────────────────────────────────────
+# Patterns listed here are excluded from version control. The goal is to
+# keep the repository clean of generated artifacts, secrets, and
+# developer-specific configuration.
+
+# Python virtual environment created by uv or pip
 .venv/
+
+# Compiled Python bytecode — regenerated on import
 __pycache__/
 *.pyc
 *.pyo
+
+# Environment files hold secrets (API keys, DB credentials, etc.).
+# The negation (!.env.example) ensures the template IS tracked so new
+# developers know which variables to set.
 .env
 .env.*
 !.env.example
+
+# uv/pyenv Python version pin — each developer may use a different minor
 .python-version
+
+# Packaging artifacts produced by `pip install -e .` or `hatch build`
 *.egg-info/
 dist/
 build/
+
+# Test and linter caches — ephemeral, machine-specific
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# macOS Finder metadata file
 .DS_Store
