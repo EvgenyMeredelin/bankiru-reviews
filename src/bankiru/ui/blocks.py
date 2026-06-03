@@ -116,7 +116,7 @@ async def get_reviews(
 #     column, BEFORE the summary slot in the right column) can reference it.
 download_url_box = gr.Textbox(value="", visible=False)
 summary = gr.Markdown(
-    height=500,
+    height=450,
     buttons=["copy"],
     container=True,
     padding=True,
@@ -147,66 +147,75 @@ with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
     with gr.Row(equal_height=True):
         # ── Left column: filter inputs ───────────────────────────────
         with gr.Column(scale=4):
-            # Date range: type="string" returns YYYYMMDD strings that
-            # the API's Request model can parse.
-            start_date = gr.DateTime(label="Start", type="string", include_time=False)
-            end_date = gr.DateTime(label="End", type="string", include_time=False)
-            # Bank filter: multi-select dropdown with top-50 banks.
-            # Default: "Сбербанк" (the largest Russian bank by complaints).
-            bank = gr.Dropdown(
-                label="Bank",
-                choices=choices.BANKS,
-                multiselect=True,
-                value="Сбербанк",
-            )
-            # Product filter: multi-select dropdown with all banking products.
-            product = gr.Dropdown(
-                label="Product",
-                choices=choices.PRODUCTS,
-                multiselect=True,
-                value=None,
-            )
-            # Location filter: multi-select dropdown with Russian regional capitals.
-            location = gr.Dropdown(
-                label="Location",
-                choices=choices.LOCATIONS,
-                multiselect=True,
-                value=None,
-            )
-            # Semantic search: free-text query that is embedded and compared
-            # against review embeddings via pgvector cosine similarity.
-            keywords = gr.Textbox(
-                label="Keywords",
-                lines=2,
-                placeholder="Describe what you're looking for...",
-                value=None,
-            )
+            with gr.Group():
+                # Date range: type="string" returns YYYYMMDD strings that
+                # the API's Request model can parse.
+                start_date = gr.DateTime(
+                    label="Start",
+                    type="string",
+                    include_time=False
+                )
+                end_date = gr.DateTime(
+                    label="End",
+                    type="string",
+                    include_time=False
+                )
+                # Bank filter: multi-select dropdown with top-50 banks.
+                # Default: "Сбербанк" (the largest Russian bank by complaints).
+                bank = gr.Dropdown(
+                    label="Bank",
+                    choices=choices.BANKS,
+                    multiselect=True,
+                    value="Сбербанк",
+                )
+                # Product filter: multi-select dropdown with all banking products.
+                product = gr.Dropdown(
+                    label="Product",
+                    choices=choices.PRODUCTS,
+                    multiselect=True,
+                    value=None,
+                )
+                # Location filter: multi-select dropdown with Russian regional capitals.
+                location = gr.Dropdown(
+                    label="Location",
+                    choices=choices.LOCATIONS,
+                    multiselect=True,
+                    value=None,
+                )
+                # Semantic search: free-text query that is embedded and compared
+                # against review embeddings via pgvector cosine similarity.
+                keywords = gr.Textbox(
+                    label="Keywords",
+                    lines=2,
+                    placeholder="Describe what you're looking for...",
+                    value=None,
+                )
 
         # ── Middle column: format, model, and action buttons ─────────
         with gr.Column(scale=4):
-            # Export format selection (CSV, JSON, Parquet, XLSX).
-            file_format = gr.Dropdown(
-                label="Format",
-                choices=choices.FILE_FORMATS,
-                value="parquet",
-            )
-            # LLM model selection for summarization. The choices are
-            # fetched from the Cloud.ru Foundation Models catalog (cached).
-            cloud_model = gr.Dropdown(
-                label="Cloud model",
-                choices=list_foundation_models(),
-                value=get_settings().DEFAULT_CLOUD_MODEL,
-            )
-
-            # Collect all input components into a list for event wiring.
-            # This list is passed as `inputs` to submit.click() and as
-            # `components` to ClearButton.
-            inputs = [
-                start_date, end_date, bank, product, location, keywords,
-                file_format, cloud_model
-            ]
-
             with gr.Group():
+                # Export format selection (CSV, JSON, Parquet, XLSX).
+                file_format = gr.Dropdown(
+                    label="Format",
+                    choices=choices.FILE_FORMATS,
+                    value="parquet",
+                )
+                # LLM model selection for summarization. The choices are
+                # fetched from the Cloud.ru Foundation Models catalog (cached).
+                cloud_model = gr.Dropdown(
+                    label="Cloud model",
+                    choices=list_foundation_models(),
+                    value=get_settings().DEFAULT_CLOUD_MODEL,
+                )
+
+                # Collect all input components into a list for event wiring.
+                # This list is passed as `inputs` to submit.click() and as
+                # `components` to ClearButton.
+                inputs = [
+                    start_date, end_date, bank, product, location, keywords,
+                    file_format, cloud_model
+                ]
+                
                 # Primary action button: triggers the API call.
                 submit = gr.Button(value="Submit", variant="primary")
                 # Clear button: resets all inputs, the summary, and the download URL.
