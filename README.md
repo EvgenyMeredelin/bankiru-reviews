@@ -73,7 +73,7 @@ flowchart TD
 
 1. Browser → Nginx (TLS) → `ui` service (`127.0.0.1:17060`).
 2. Gradio calls `GET /reviews` on the `api` service (internal compose network).
-3. `api` queries Postgres, serialises to the requested format, uploads to S3, generates a pre-signed URL, runs the LLM summarizer, and returns a JSON body with `{url, comment}`.
+3. `api` queries Postgres, serialises to the requested format, uploads to S3, generates a pre-signed URL, runs the LLM summarizer, and returns a JSON body with `{url, comment}` (the summary header includes `**Summary model:**` and the model name).
 4. UI renders the summary in the Markdown panel; the "Download reviews" button opens the pre-signed URL in a new browser tab — **the browser fetches the file directly from OBS**, no server round-trip. The "Download summary" button saves the summary as a local `.md` file (client-side Blob, no server round-trip).
 
 ---
@@ -82,10 +82,10 @@ flowchart TD
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
+| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Spawns a background embedding backfill on startup. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
 | `parser` | Same image, `command: python -m bankiru.parser` | APScheduler cron job. Crawls banki.ru once daily, collects negative reviews for the previous `PARSER_DAYS` days, and POSTs the deduplicated batch to the `api`. |
 | `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
-| External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is created automatically at `api` startup via `Base.metadata.create_all`. |
+| External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is bootstrapped at `api` startup via `create_all_tables()` (pgvector extension, ORM tables, B-tree indexes, HNSW vector index — all idempotent). |
 | External: S3 / OBS | (managed elsewhere) | Stores named export files (pre-signed 1-hour URLs) and daily Parquet backups (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`). |
 | External: Authentik | `https://uva-advanced.ru` | OIDC identity provider for the UI login flow. |
 | External: Infisical | `https://infisical.uva-advanced.ru` | Secrets store; `scripts/start.sh` pulls secrets into `/dev/shm` at boot. |
@@ -163,7 +163,9 @@ No auth. Returns `{"status": "ok"}`. Used by Docker's `healthcheck`.
 ]
 ```
 
-Inserts all rows, commits, then uploads the batch as a daily Parquet backup (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) to S3. Returns `201 Created` with no body.
+Inserts all rows, commits, generates vector embeddings for the new reviews (inline, best-effort), then uploads the batch as a daily Parquet backup (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) to S3. Returns `201 Created` with no body.
+
+An empty JSON array (`[]`) is accepted and also returns `201` without touching the database or S3. If embedding generation fails for a batch, the reviews are still saved; missing embeddings are backfilled on the next API restart (see [Semantic search](#semantic-search)).
 
 ### `GET /reviews` — filter, export, and summarize
 
@@ -180,7 +182,7 @@ Inserts all rows, commits, then uploads the batch as a daily Parquet backup (`ba
 | `product` | repeatable string | Exact match on `product`. |
 | `keywords` | `string` | Free-text semantic search. When provided, reviews are ranked by cosine similarity to the embedded query (via BAAI/bge-m3) and capped at `SEMANTIC_SEARCH_LIMIT` (default 200). Combinable with all other filters. |
 | `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | Default: `parquet`. |
-| `cloudModel` | string | Override the summarization model. Default: `DEFAULT_CLOUD_MODEL`. |
+| `cloudModel` | string | Override the summarization model. Default: `DEFAULT_CLOUD_MODEL`. The UI dropdown label is **Summary model**; the query parameter name is unchanged. |
 
 **Successful response** (JSON):
 
@@ -196,7 +198,7 @@ Inserts all rows, commits, then uploads the batch as a daily Parquet backup (`ba
   "cloudModel": "anthropic/claude-sonnet-4.6",
   "filename": "a1b2c3d4-….xlsx",
   "url": "https://obs.cloud.ru/…?X-Amz-Expires=3600…",
-  "comment": "**Cloud model:** `anthropic/claude-sonnet-4.6`\n\n## Наиболее острые темы…"
+  "comment": "**Summary model:** `anthropic/claude-sonnet-4.6`\n\n## Наиболее острые темы…"
 }
 ```
 
@@ -267,7 +269,7 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 ## Parser — crawl mechanics
 
-**Products covered:** 24 banking products (12 retail + 12 business). Defined in `parser/settings.py` as a `{slug: label}` dict. Note: banki.ru uses both `corporate` and `legal` slugs for "Обслуживание юридических лиц" — both are crawled and the crawler's in-memory deduplication discards the duplicate bodies.
+**Products covered:** 25 URL slugs mapping to 24 distinct product labels (12 retail + 12 business). Defined in `parser/settings.py` as a `{slug: label}` dict. Note: banki.ru uses both `corporate` and `legal` slugs for "Обслуживание юридических лиц" — both are crawled and the crawler's in-memory deduplication discards the duplicate bodies.
 
 **Crawl loop (per product):**
 
@@ -275,8 +277,8 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 2. Extract review candidates from the listing HTML using two regexes:
    - `REVIEW_CONTENT_PATTERN` — matches inlined JSON-LD `Review` objects (strips out the fields we don't need: author, rating, postal address).
    - `REVIEW_URL_PATTERN` — matches the href of each review's detail-page link.
-   Both iterators are zipped so content and URL stay aligned.
-3. For each candidate in the date window `[start_date, end_date)`: fetch the detail page, extract the author's city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`), and append the finished record. If the detail page fails, `location` is stored as `""` — the review is never dropped.
+   Both iterators are zipped so content and URL stay aligned. If the match counts differ, a warning is logged and `zip()` may pair mismatched entries — a signal that banki.ru changed its HTML or a regex needs updating.
+3. For each candidate in the date window `[start_date, end_date)`: parse the JSON-LD fragment; **malformed JSON is skipped** (logged, crawl continues). Fetch the detail page, extract the author's city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`), and append the finished record. If the detail page fails, `location` is stored as `""` — the review is never dropped.
 4. Stop paginating when the oldest review on the page predates `start_date` (`hit_left_boundary = True`) or the page contains no review markup at all (past the last page). Crucially, the crawler does **not** stop when `candidates` is empty: a page full of today's reviews (all newer than `end_date`) still needs to be paginated through to reach the date window.
 5. After all products: deduplicate in-memory on `(reviewBody, product)` via pandas `drop_duplicates`.
 
@@ -383,7 +385,11 @@ Actual run time is 0.5–1.5 hours because many products have only 1–2 listing
 
 ### POST batch delivery
 
-After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate the daily Parquet backup that the API uploads after every insert. The POST retries **indefinitely** with exponential back-off capped at 60 s — after spending hours crawling, losing the batch to a transient API outage would be wasteful.
+After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate bulk INSERT, inline embedding generation, and the daily Parquet backup the API uploads after every insert.
+
+Before the first POST attempt, the runner polls `GET /healthz` (up to 30 × 5 s) so a mid-crawl API restart does not fail the delivery immediately.
+
+The POST retries **indefinitely** with exponential back-off capped at 60 s for transient failures (network errors, 5xx). **Client errors do not retry:** `401`, `403`, `404`, and `422` fail fast so a bad token or malformed payload surfaces immediately instead of looping for hours.
 
 ### Other implementation details
 
@@ -442,17 +448,18 @@ The `// 4` cap prevents a small-context model (e.g. 4 k tokens) with a large `OU
 The Keywords field in the UI enables semantic (vector) search over review texts. When keywords are provided, the system:
 
 1. Embeds the query text using **BAAI/bge-m3** (1024-dim, multilingual) via the Cloud.ru Foundation Models `/v1/embeddings` endpoint.
-2. JOINs `bankiru.reviews` with `bankiru.review_embeddings` and applies all scalar filters (date range, bank, product, location).
-3. Ranks the filtered results by cosine distance to the query vector using pgvector's HNSW index.
-4. Returns the top `SEMANTIC_SEARCH_LIMIT` (default 200) most relevant reviews.
+2. **INNER JOIN**s `bankiru.reviews` with `bankiru.review_embeddings`, applies all scalar filters (date range, bank, product, location), then ranks by cosine distance.
+3. Returns the top `SEMANTIC_SEARCH_LIMIT` (default 200) most relevant reviews.
 
-When no keywords are provided, the query path is unchanged — all matching reviews are returned without vector ranking.
+Reviews that have no embedding row yet are **excluded** from keyword search (they still appear in non-keyword queries and are picked up once backfill completes). When embedding the query fails, the API returns a JSON body with an error message in `comment` instead of crashing.
+
+When no keywords are provided, the query path is unchanged — all matching reviews are returned without vector ranking. There is **no row limit** on this path; very broad filters on a large table can produce heavy exports and long LLM runs.
 
 ### Embedding pipeline
 
 - **New reviews:** Embedded inline during `POST /reviews`. If embedding fails, the review is saved without an embedding and will be backfilled later.
-- **Startup backfill:** At API startup, a background task embeds any reviews that don't yet have embeddings.
-- **Reindex CLI:** `python -m bankiru.embedder reindex --confirm` regenerates all embeddings from scratch (required after swapping the embedding model).
+- **Startup backfill:** At API startup, a background task embeds any reviews that don't yet have embeddings. A batch that fails repeatedly is skipped for the rest of that run (avoiding an infinite loop); those rows are retried on the next restart or via the CLI.
+- **Reindex CLI:** `python -m bankiru.embedder reindex --confirm` regenerates all embeddings from scratch (required after swapping the embedding model). The embedder is a **CLI module**, not a long-lived Compose service — run it with `docker exec bankiru-api`.
 
 ### Reindexing
 
@@ -479,11 +486,17 @@ docker exec bankiru-api python -m bankiru.embedder backfill
    - Set `EMBEDDINGS_API_KEY` (or reuse `OPENAI_API_KEY` — the embedder falls back automatically)
    - Optionally set `EMBEDDINGS_BASE_URL` and `EMBEDDINGS_MODEL` if different from defaults
 
-3. **Deploy:**
+3. **Deploy** (always via `start.sh` so secrets and compose interpolation stay in sync):
+
    ```bash
-   git checkout semantic-search
-   docker compose build
-   docker compose up -d
+   ./scripts/start.sh --refresh
+   ```
+
+   Or, if secrets are already on tmpfs and only the image changed:
+
+   ```bash
+   docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env build
+   docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env up -d --force-recreate api parser ui
    ```
 
 4. **Monitor the backfill:**
@@ -499,6 +512,8 @@ docker exec bankiru-api python -m bankiru.embedder backfill
 ## UI and authentication
 
 The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application inside a FastAPI app. The FastAPI layer handles OIDC; the Gradio layer handles the review query form.
+
+**Layout:** three columns inside a full-height Blocks page — filters (left), format/model/actions (middle), summary (right). The summary lives in a **Summary** accordion with a fixed-height Markdown panel (490 px), a **copy** button, and a toast after Submit. Buttons use the Ocean theme with **zero corner radius** (rectangular). The Gradio footer is hidden via mount CSS.
 
 **OIDC flow:**
 
@@ -520,15 +535,16 @@ The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application ins
 |---------|------|-------|
 | Start / End | DateTime | Date range filter (no time component). |
 | Bank | Multi-select dropdown | 50 banks pre-loaded in `choices.py` (top-50 by complaint volume 2025). Default: `Сбербанк`. |
-| Product | Multi-select dropdown | 23 banking product labels matching the parser's product catalog. |
+| Product | Multi-select dropdown | 23 banking product labels in `choices.py` (one entry per distinct label; the parser crawls 25 URL slugs including both `corporate` and `legal` for "Обслуживание юридических лиц"). |
 | Location | Multi-select dropdown | 88 Russian regional capitals. Uses `startswith` matching on the server side. |
-| Keywords | Textbox | Free-text semantic search query. When provided, reviews are ranked by cosine similarity to the embedded query and capped at `SEMANTIC_SEARCH_LIMIT`. |
+| Keywords | Textbox (single line) | Free-text semantic search query. When provided, reviews are ranked by cosine similarity to the embedded query and capped at `SEMANTIC_SEARCH_LIMIT`. Only reviews with embeddings participate. |
 | Format | Single-select dropdown | `csv`, `json`, `parquet`, `xlsx`. Default: `parquet`. |
-| Cloud model | Single-select dropdown | Populated from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. |
-| Submit | Button | Calls `GET /reviews`, populates the Summary panel and stores the signed URL. |
+| Summary model | Single-select dropdown | Populated from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. Choices are resolved **once at UI process start** — restart the `ui` container after provider catalog changes. |
+| Submit | Button | Calls `GET /reviews`, populates the Summary panel and stores the signed URL. Shows a short toast ("Download your file"). |
 | Clear | Button | Resets all inputs, the summary, and the hidden URL state. |
 | Download reviews | Button | Client-side JS: opens the stored pre-signed URL in a new tab. No server round-trip. |
 | Download summary | Button | Client-side JS: saves the summary Markdown panel content as a `.md` file. Filename matches the reviews file (same stem, `.md` extension). No server round-trip. |
+| Summary panel | Markdown (in accordion) | Displays the LLM summary; includes a copy button. Header in the API response uses `**Summary model:**` plus the model name. |
 
 **Session details:** Starlette `SessionMiddleware`, signed cookie `bankiru_session`, `same_site=lax`, `https_only=True`, 1-hour TTL. Session payload: `{sub, username, email, id_token}`.
 
@@ -604,7 +620,7 @@ bankiru-reviews/
     │   └── botocore_client.py      # aiobotocore async S3 client factory
     ├── embedder/
     │   ├── __init__.py             # embed_texts(), backfill_embeddings(), reindex_embeddings()
-    │   └── __main__.py             # CLI: python -m bankiru.embedder {backfill,reindex}
+    │   └── __main__.py             # CLI (not a Compose service): backfill | reindex [--confirm]
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
     │   ├── runner.py               # run_once(days=N); POST with unlimited retry
@@ -614,8 +630,8 @@ bankiru-reviews/
     │   └── tools.py                # clean_text_pipe (double strip-tags → emoji → strip)
     └── ui/
         ├── __main__.py             # uvicorn entry; auto-traces ui.app + ui.blocks
-        ├── app.py                  # FastAPI + SessionMiddleware + Authlib OIDC + Gradio
-        ├── blocks.py               # Gradio Blocks; async get_reviews; Download JS
+        ├── app.py                  # FastAPI + SessionMiddleware + Authlib OIDC + Gradio mount (Ocean theme, rectangular buttons)
+        ├── blocks.py               # Gradio Blocks (3-column layout); async get_reviews; Download JS
         ├── choices.py              # static BANKS / LOCATIONS / PRODUCTS / FILE_FORMATS
         └── foundation_models.py    # sync wrapper; TTL cache; fail-soft to hardcoded list
 ```
@@ -682,7 +698,7 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | `PARSER_BAN_PAUSE_MAX` | `300.0` | Max back-off pause (seconds) during connect-error streaks. |
 | `OPENAI_API_KEY` | `None` | Required for LLM summarization and the model dropdown. |
 | `OPENAI_BASE_URL` | `https://foundation-models.api.cloud.ru/v1` | OpenAI-compatible base URL. Any OpenAI-compatible provider works. |
-| `DEFAULT_CLOUD_MODEL` | `anthropic/claude-sonnet-4.6` | Default summarization model. |
+| `DEFAULT_CLOUD_MODEL` | `anthropic/claude-sonnet-4.6` | Default summarization model (UI label: **Summary model**). |
 | `OUTPUT_TOKENS_LIMIT` | `50000` | Per-call output token cap (clipped to `max_model_len // 4` for small-context models). |
 | `DEFAULT_MODEL_CONTEXT` | `200000` | Fallback context window when the Cloud.ru `/models` catalog is unreachable. |
 | `SUMMARIZER_MAP_CONCURRENCY` | `4` | Maximum concurrent LLM calls in the map pass. |
@@ -732,7 +748,7 @@ sudo nginx -t && sudo systemctl reload nginx
 ./scripts/start.sh
 
 # 6. Verify
-docker compose ps
+docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env ps
 curl http://localhost:1706/healthz   # {"status": "ok"}
 open https://bankiru.uva-advanced.ru
 ```
@@ -769,7 +785,7 @@ Trigger a one-off crawl (bypassing the cron schedule):
 
 ```bash
 uv run python -c "
-from bankiru.logging import configure_logfire; configure_logfire('bankiru-parser')
+from bankiru.logging import configure_logfire; configure_logfire('parser')
 import asyncio; from bankiru.parser.runner import run_once; asyncio.run(run_once())
 "
 ```
@@ -778,7 +794,7 @@ Trigger a one-off crawl for a specific date range (e.g. May 17–18):
 
 ```bash
 uv run python -c "
-from bankiru.logging import configure_logfire; configure_logfire('bankiru-parser')
+from bankiru.logging import configure_logfire; configure_logfire('parser')
 import asyncio; from bankiru.parser.runner import run_once
 asyncio.run(run_once(start_date='2026-05-17', end_date='2026-05-19'))
 "
@@ -797,22 +813,26 @@ docker logs -f bankiru-api
 docker logs -f bankiru-parser
 docker logs -f bankiru-ui
 
-# Pick up rotated secrets + recreate containers
+# Pick up rotated secrets + rebuild image + recreate containers
 ./scripts/start.sh --refresh
+
+# After UI-only code changes (skip full secret refresh if tmpfs .env is current):
+docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env build ui
+docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env up -d --force-recreate ui
 
 # One-off parser run (backfill yesterday)
 docker exec bankiru-parser python -c "
-from bankiru.logging import configure_logfire; configure_logfire('bankiru-parser')
+from bankiru.logging import configure_logfire; configure_logfire('parser')
 import asyncio; from bankiru.parser.runner import run_once; asyncio.run(run_once())"
 
 # Backfill the last 7 days
 docker exec bankiru-parser python -c "
-from bankiru.logging import configure_logfire; configure_logfire('bankiru-parser')
+from bankiru.logging import configure_logfire; configure_logfire('parser')
 import asyncio; from bankiru.parser.runner import run_once; asyncio.run(run_once(days=7))"
 
 # Crawl a specific date range (e.g. May 17–18; end_date is exclusive)
 docker exec bankiru-parser python -c "
-from bankiru.logging import configure_logfire; configure_logfire('bankiru-parser')
+from bankiru.logging import configure_logfire; configure_logfire('parser')
 import asyncio; from bankiru.parser.runner import run_once; asyncio.run(run_once(start_date='2026-05-17', end_date='2026-05-19'))"
 
 # Delete reviews for a date range (e.g. May 17–18; both dates inclusive)
@@ -821,6 +841,9 @@ curl -s -X DELETE -H "API-Token: $API_TOKEN" \
 
 # Deduplicate the database (keeps lowest id per reviewBody+product)
 curl -s -X DELETE -H "API-Token: $API_TOKEN" http://localhost:1706/reviews/duplicates
+
+# Backfill missing embeddings (manual, if startup backfill failed)
+docker exec bankiru-api python -m bankiru.embedder backfill
 
 # Postgres backup (external DB)
 pg_dump "$POSTGRES_URL" --no-owner --no-acl | gzip > backup-$(date +%F).sql.gz
@@ -871,7 +894,7 @@ Update the values in Infisical (or edit `/dev/shm/bankiru-reviews-secrets/.env` 
 
 ```bash
 # Minimal restart — only the parser; api and ui stay up
-docker compose restart parser
+docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env restart parser
 ```
 
 The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces the old one.
@@ -887,19 +910,45 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 ## Описание проекта (на русском)
 
-- Назначение системы — централизованный мониторинг негативных отзывов и претензий к российским банкам, публикуемых на портале banki.ru (оценки 1–2 звезды).
-- Источник данных — banki.ru; рубрикатор покрывает 24 банковские услуги для физических и юридических лиц. Парсер ежедневно собирает все отзывы за истекшие `PARSER_DAYS` суток (по умолчанию 1) и пакетом отправляет их в API.
-- Стратегия запросов — намеренно простая и последовательная: один запрос за раз, случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Непредсказуемый тайминг имитирует поведение пользователя. Раздельные таймауты на соединение и чтение. Ошибки соединения (вероятный бан WAF) ретраятся бесконечно с экспоненциальным back-off. HTTP/2 отключён (WAF banki.ru блокирует ALPN `h2`).
-- API предоставляет пять эндпоинтов: `POST /reviews` (приём от парсера, требует `API-Token`), `GET /reviews` (фильтрация и выгрузка, публичный), `DELETE /reviews` (удаление по ID, требует `API-Token`), `DELETE /reviews/by-date` (удаление по диапазону дат, требует `API-Token`), `DELETE /reviews/duplicates` (дедупликация по `reviewBody` + `product`, требует `API-Token`).
-- Поддерживаются фильтры по диапазону дат, банкам (точное совпадение), банковским услугам (точное совпадение) и городам авторов жалоб (префиксный поиск через `startswith`).
-- Поддерживаются форматы выгрузки `csv`, `json`, `parquet` и `xlsx`; ссылка на скачивание возвращается в виде pre-signed URL объектного хранилища. После каждого добавления записей (POST от парсера) API автоматически сохраняет ежедневную резервную копию собранного пакета (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) в объектном хранилище.
-- Суммаризация выполняется LLM-моделью (Cloud.ru Foundation Models, OpenAI-совместимый протокол) по схеме map-reduce: пользователь получает связное резюме при любом количестве отзывов. Результат — всегда строка; ошибки провайдера отображаются как текст.
-- Веб-интерфейс реализован на Gradio; работает поверх FastAPI. Кнопка «Download reviews» открывает pre-signed URL в новой вкладке браузера — файл скачивается напрямую из OBS без промежуточного сервера. Кнопка «Download summary» сохраняет содержимое панели Summary в виде `.md`-файла (клиентский Blob, без обращения к серверу).
-- Авторизация — через Authentik (OIDC) с фиксированным `redirect_uri`, корректным RP-initiated logout и заголовками безопасности (HSTS, X-Frame-Options, Referrer-Policy) на уровне Nginx.
-- Инфраструктура — Docker Compose, единый образ, три сервиса (`api`, `parser`, `ui`); внешние зависимости (Postgres, S3, Authentik, Infisical) в стеке не разворачиваются.
-- Наблюдаемость — Logfire spans + `install_auto_tracing` для API и UI; парсер использует явные spans и `logfire.info()`.
-- Управление секретами — Infisical Universal Auth → tmpfs (`/dev/shm`); секреты не записываются на SSD и стираются при перезагрузке хоста.
-- Расширяемость форматов выгрузки — новый формат добавляется подклассом `ScalarsHandler` с суффиксом `Maker` в `handlers.py`; регистрация автоматическая через `inspect.getmembers`.
+Краткое описание системы на русском языке. Подробности — в англоязычных разделах выше.
+
+**Назначение.** Централизованный сбор, хранение и анализ негативных отзывов и претензий к российским банкам с портала [banki.ru](https://www.banki.ru) (оценки 1–2 звезды): фильтрация, выгрузка в объектное хранилище и LLM-суммаризация через веб-интерфейс.
+
+**Источник данных и парсер.** Ежедневный cron (APScheduler, по умолчанию 00:05 `Europe/Moscow`) обходит 25 URL-слагов (24 уникальных названия продуктов: 12 для физлиц и 12 для юрлиц; слаги `corporate` и `legal` ведут к одной услуге «Обслуживание юридических лиц»). За каждый запуск собираются отзывы за последние `PARSER_DAYS` календарных суток (по умолчанию 1 — «вчера») и одним пакетом отправляются в API. Перед POST парсер опрашивает `GET /healthz`; при сбоях сети и 5xx повторяет отправку бесконечно с экспоненциальной паузой (до 60 с), но при 401/403/404/422 сразу завершается с ошибкой.
+
+**Стратегия обхода banki.ru.** Один HTTP-запрос за раз; перед каждым — случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Раздельные таймауты на соединение и чтение. Ошибки TCP-соединения (вероятный бан WAF) повторяются без лимита с нарастающей задержкой. HTTP/2 отключён — WAF banki.ru отбрасывает ALPN `h2`. Дедупликация в памяти и в БД — по паре `(reviewBody, product)` (в SQL через `md5(reviewBody)`).
+
+**Хранение.** Внешний PostgreSQL, схема `bankiru`: таблицы `reviews` и `review_embeddings` (pgvector, 1024 измерения, индекс HNSW). Схема создаётся при старте API (`create_all_tables()`). Ежедневный бэкап пакета парсера — Parquet в OBS: `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`.
+
+**API** (сервис `api`, порт по умолчанию 1706):
+
+| Эндпоинт | Аутентификация | Назначение |
+|----------|----------------|------------|
+| `GET /healthz` | нет | Проверка живости (Docker healthcheck) |
+| `GET /` | нет | Редирект на `/docs` (Swagger) |
+| `POST /reviews` | заголовок `API-Token` | Приём пакета от парсера: INSERT, inline-эмбеддинги, бэкап в S3. Пустой массив `[]` — `201` без записи в БД |
+| `GET /reviews` | **нет (публичный)** | Фильтры, выгрузка (csv/json/parquet/xlsx), pre-signed URL, LLM-суммаризация |
+| `DELETE /reviews` | `API-Token` | Удаление по списку ID |
+| `DELETE /reviews/by-date` | `API-Token` | Удаление по диапазону дат (включительно) |
+| `DELETE /reviews/duplicates` | `API-Token` | Дедупликация таблицы (остаётся строка с минимальным `id`) |
+
+**Фильтры `GET /reviews`:** диапазон дат; банк и продукт — точное совпадение; город — префикс (`startswith`). Поле **Keywords** — семантический поиск (BAAI/bge-m3, pgvector, косинусное расстояние, лимит `SEMANTIC_SEARCH_LIMIT`, по умолчанию 200). В keyword-поиск попадают **только отзывы с готовыми эмбеддингами** (INNER JOIN). Без Keywords лимита строк нет — широкий фильтр на большой таблице может дать тяжёлую выгрузку и долгую суммаризацию.
+
+**Суммаризация.** Map-reduce через Cloud.ru Foundation Models (OpenAI-совместимый API). Модель задаётся параметром `cloudModel` или значением по умолчанию `DEFAULT_CLOUD_MODEL`; в UI — выпадающий список **Summary model**. В ответе API заголовок резюме: `**Summary model:** \`…\``. Ошибки провайдера возвращаются текстом в поле `comment`, а не HTTP 500.
+
+**Эмбеддинги.** Сразу при `POST /reviews` (best-effort); фоновый backfill при старте API; ручной запуск: `docker exec bankiru-api python -m bankiru.embedder backfill` или полный пересчёт `reindex --confirm`. Модуль embedder — **CLI**, не отдельный сервис Compose.
+
+**Веб-интерфейс** (сервис `ui`, Gradio + FastAPI + Authentik OIDC). На хосте слушает только `127.0.0.1:17060`; снаружи — через Nginx (TLS). Трёхколоночный макет: фильтры слева, формат/модель/кнопки в центре, панель **Summary** справа (аккордеон, высота 490 px, кнопка копирования). Кнопки прямоугольные (тема Ocean, радиус 0). Список моделей загружается **один раз при старте** контейнера `ui`. **Submit** вызывает `GET /reviews`; **Download reviews** открывает pre-signed URL напрямую в OBS; **Download summary** сохраняет Markdown локально (Blob в браузере).
+
+**Безопасность UI.** Authentik (OIDC): фиксированный `OIDC_REDIRECT_URI`, RP-initiated logout с `id_token_hint`, сессия `{sub, username, email, id_token}`. На Nginx — HSTS, `X-Content-Type-Options`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`, блокировка dotfile-запросов. Swagger на сервисе `ui` отключён. Эндпоинт `GET /reviews` на сервисе `api` **не требует токена** — учитывайте при публикации порта API.
+
+**Инфраструктура и секреты.** Docker Compose: один образ, три сервиса (`api`, `parser`, `ui`). Postgres, S3/OBS, Authentik и Infisical **не** входят в compose. В продакшене стек запускается только через `./scripts/start.sh` — секреты из Infisical в tmpfs (`/dev/shm/bankiru-reviews-secrets/.env`), на диск не пишутся и стираются при перезагрузке хоста.
+
+**Наблюдаемость.** Logfire: имена сервисов `api`, `parser`, `ui`, `embedder`; auto-tracing для модулей API и UI; парсер — явные spans.
+
+**Расширяемость.** Новый формат выгрузки — подкласс `*Maker` в `handlers.py`; регистрация автоматическая через `inspect.getmembers` в `schemas.py`.
+
+**Эксплуатация.** Расписание парсера можно менять без перезапуска контейнера (SIGHUP + `/app/.env` внутри контейнера) — см. раздел «Changing the daily crawl schedule» выше. После изменений кода UI: пересборка и `--force-recreate ui`.
 
 ---
 
@@ -915,6 +964,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 - [httpx](https://www.python-httpx.org/)
 - [tiktoken](https://github.com/openai/tiktoken)
 - [pydantic-ai](https://ai.pydantic.dev/)
+- [pgvector](https://github.com/pgvector/pgvector)
 - [Logfire](https://logfire.pydantic.dev/)
 - [Authlib](https://docs.authlib.org/)
 - [Gradio](https://www.gradio.app/)

@@ -12,14 +12,13 @@ Security posture (see README "Security hardening"):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
 from urllib.parse import urlencode
 
 import gradio as gr
 import logfire
 from authlib.integrations.base_client.errors import OAuthError
 from authlib.integrations.starlette_client import OAuth
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import RedirectResponse
@@ -253,9 +252,24 @@ def create_app() -> FastAPI:
         blocks=gradio_ui,
         path="/gradio",
         auth_dependency=get_user,
-        theme=gr.themes.Ocean(),
-        # Hide the Gradio footer ("Built with Gradio") for a cleaner look.
-        css="footer {visibility: hidden}",
+        # Ocean theme with zero button radius — rectangular buttons match the
+        # rest of the layout (Gradio's default is heavily rounded).
+        theme=gr.themes.Ocean().set(
+            button_large_radius="0px",
+            button_medium_radius="0px",
+            button_small_radius="0px",
+        ),
+        # Custom CSS injected into the Gradio mount:
+        #   - hide the "Built with Gradio" footer
+        #   - match summary panel bottom inset to horizontal block padding
+        #     (elem_id is set on the Markdown component in blocks.py)
+        css="""
+footer {visibility: hidden}
+#summary-panel.block.padded,
+#summary-panel .padding {
+    padding-bottom: calc(var(--spacing-xl) + 2px);
+}
+""",
     )
     return mounted
 

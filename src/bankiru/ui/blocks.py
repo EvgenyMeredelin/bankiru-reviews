@@ -120,6 +120,8 @@ summary = gr.Markdown(
     buttons=["copy"],
     container=True,
     padding=True,
+    # Stable DOM id for mount-time CSS in app.py (summary bottom padding tweak).
+    elem_id="summary-panel",
 )
 
 
@@ -201,7 +203,7 @@ with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
             # LLM model selection for summarization. The choices are
             # fetched from the Cloud.ru Foundation Models catalog (cached).
             cloud_model = gr.Dropdown(
-                label="Cloud model",
+                label="Summary model",
                 choices=list_foundation_models(),
                 value=get_settings().DEFAULT_CLOUD_MODEL,
             )
@@ -213,7 +215,7 @@ with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
                 start_date, end_date, bank, product, location, keywords,
                 file_format, cloud_model
             ]
-            
+
             # Primary action button: triggers the API call.
             submit = gr.Button(value="Submit", variant="primary")
             # Clear button: resets all inputs, the summary, and the download URL.

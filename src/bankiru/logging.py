@@ -39,7 +39,10 @@ def configure_logfire(service_name: str) -> None:
     to the same Logfire backend. This is important because some
     dependencies (e.g. APScheduler, httpx) log via the stdlib logger.
     """
+    # Tag every trace/log line with the service name (api, parser, ui, embedder).
     logfire.configure(service_name=service_name)
+    # Bridge stdlib logging → Logfire so third-party libraries appear in the
+    # same dashboard without switching to the logfire API directly.
     logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()])
 
 
@@ -55,4 +58,6 @@ def install_auto_tracing(modules: list[str]) -> None:
     Called at service startup alongside configure_logfire(). Each service
     traces only its own module subtree to avoid redundant instrumentation.
     """
+    # min_duration=0 traces every call (even sub-millisecond helpers). Good for
+    # debugging; increase if trace volume becomes costly in production.
     logfire.install_auto_tracing(modules=modules, min_duration=0)

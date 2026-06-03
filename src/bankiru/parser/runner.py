@@ -169,6 +169,24 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
                     "POST {endpoint} -> {status}", endpoint=endpoint, status=response.status_code
                 )
                 return
+            except httpx.HTTPStatusError as exc:
+                # Client errors (bad token, wrong URL, invalid payload) will not
+                # succeed on retry — fail fast so the operator sees the problem.
+                # Transient server errors (5xx) and rate limits fall through to
+                # the backoff loop below.
+                if exc.response.status_code in {401, 403, 404, 422}:
+                    logfire.error(
+                        "POST {endpoint} failed with {status}: not retrying",
+                        endpoint=endpoint,
+                        status=exc.response.status_code,
+                    )
+                    raise
+                delay = min(60, 2**attempt)
+                logfire.warning(
+                    "POST attempt={n} failed: {exc} (retry in {delay}s)",
+                    n=attempt, exc=repr(exc), delay=delay,
+                )
+                await asyncio.sleep(delay)
             except httpx.HTTPError as exc:
                 # Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60, ...
                 delay = min(60, 2**attempt)

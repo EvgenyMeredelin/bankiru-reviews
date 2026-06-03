@@ -150,6 +150,11 @@ async def post_reviews(
     If embedding generation fails, the reviews are still inserted — missing
     embeddings will be backfilled on the next API restart (see app.py lifespan).
     """
+    # Fast path: an empty JSON array is valid but there is nothing to insert,
+    # embed, or back up. Return 201 with no body instead of running empty SQL.
+    if not reviews:
+        return None
+
     with logfire.span("Create new entries"):
         # Validate via Pydantic, then pass raw dicts straight to a bulk
         # INSERT instead of instantiating N ORM objects + N individual
@@ -323,7 +328,7 @@ async def get_reviews(
             **r.model_dump(),
             filename=handler.key,
             url=url,
-            comment=f"**Cloud model:** `{model_name}`\n\n{comment}",
+            comment=f"**Summary model:** `{model_name}`\n\n{comment}",
         )
 
 

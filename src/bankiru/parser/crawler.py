@@ -209,17 +209,33 @@ class BankiruCrawler:
         # Pair up content matches (JSON-LD structured data) with URL matches
         # (review detail page links). Both regexes match in the same order
         # on the page, so zip() correctly pairs them.
-        match_pairs = zip(
-            REVIEW_CONTENT_PATTERN.finditer(page_text),
-            REVIEW_URL_PATTERN.finditer(page_text),
-        )
+        # Materialise iterators so we can compare counts before zipping.
+        # A mismatch means the page HTML changed or a regex missed a review;
+        # zip() would silently drop the extra matches without this check.
+        content_matches = list(REVIEW_CONTENT_PATTERN.finditer(page_text))
+        url_matches = list(REVIEW_URL_PATTERN.finditer(page_text))
+        if len(content_matches) != len(url_matches):
+            logfire.warning(
+                "Listing page match count mismatch: {content} content vs {url} url",
+                content=len(content_matches),
+                url=len(url_matches),
+            )
+        match_pairs = zip(content_matches, url_matches)
 
         for content_match, url_match in match_pairs:
             any_matched = True
             # Reconstruct the JSON-LD object from the regex capture groups.
             # The regex captures only the parts we need (datePublished,
             # reviewBody, itemReviewed.name), skipping author/rating fields.
-            raw = json.loads("".join(content_match.groups()))
+            # Malformed JSON on one review must not abort the whole page.
+            try:
+                raw = json.loads("".join(content_match.groups()))
+            except json.JSONDecodeError as exc:
+                logfire.warning(
+                    "Skipping malformed review JSON-LD on listing page: {exc}",
+                    exc=str(exc),
+                )
+                continue
             date_published = dt.datetime.strptime(
                 raw["datePublished"], "%Y-%m-%d %H:%M:%S"
             )

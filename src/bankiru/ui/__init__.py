@@ -21,7 +21,7 @@
 #   choices.py           — static dropdown choices: locations, banks, products,
 #                          file formats
 #   foundation_models.py — lazy, TTL-cached list of available LLM models for
-#                          the "Cloud model" dropdown
+#                          the "Summary model" dropdown
 #
 # Data flow:
 #   Browser → Nginx (TLS) → FastAPI (OIDC auth) → Gradio UI

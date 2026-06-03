@@ -116,8 +116,22 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
             data = sorted(resp.json()["data"], key=lambda d: d["index"])
             all_embeddings.extend(d["embedding"] for d in data)
 
-    return all_embeddings
+    # Sanity-check the API response before writing vectors to pgvector.
+    # A count or dimension mismatch would corrupt semantic search or fail at
+    # INSERT time with a cryptic Postgres error — fail early with a clear message.
+    expected_dim = settings.EMBEDDINGS_DIMENSIONS
+    if len(all_embeddings) != len(texts):
+        raise RuntimeError(
+            f"Embeddings API returned {len(all_embeddings)} vectors for "
+            f"{len(texts)} inputs"
+        )
+    for i, vec in enumerate(all_embeddings):
+        if len(vec) != expected_dim:
+            raise RuntimeError(
+                f"Embedding {i} has dimension {len(vec)}, expected {expected_dim}"
+            )
 
+    return all_embeddings
 
 async def _post_with_retry(
     client: httpx.AsyncClient,
@@ -211,6 +225,9 @@ async def backfill_embeddings(
     embedded = 0
     batch_num = 0
     t0 = _time.monotonic()
+    # Review IDs whose embedding batch failed in this run. Excluded from later
+    # SELECTs so a broken batch does not get re-fetched on every loop iteration.
+    skipped_ids: set[int] = set()
 
     # Main backfill loop: fetch un-embedded reviews in batches, embed them,
     # and insert the embeddings into the database.
@@ -219,7 +236,7 @@ async def backfill_embeddings(
         # ORDER BY id ensures deterministic pagination (always processes
         # the oldest un-embedded reviews first).
         async with session_maker() as session:
-            result = await session.execute(
+            stmt = (
                 select(Review.id, Review.reviewBody)
                 .outerjoin(
                     ReviewEmbedding, ReviewEmbedding.review_id == Review.id,
@@ -228,6 +245,10 @@ async def backfill_embeddings(
                 .order_by(Review.id)
                 .limit(batch_size)
             )
+            # Exclude batches that already failed in this run (see except below).
+            if skipped_ids:
+                stmt = stmt.where(Review.id.not_in(skipped_ids))
+            result = await session.execute(stmt)
             rows = result.all()
 
         if not rows:
@@ -243,15 +264,17 @@ async def backfill_embeddings(
             # embed_texts() handles sub-batching internally.
             vectors = await embed_texts(texts)
         except Exception:
-            # If embedding fails for this batch, skip it and continue.
-            # The skipped reviews will be picked up on the next backfill run.
+            # Skip this batch for the rest of this run so a persistent failure
+            # does not spin forever. Rows stay un-embedded until the next backfill.
+            skipped_ids.update(ids)
             logfire.warning(
-                "Batch {batch}/{batches} starting at review_id={first_id} failed, skipping",
+                "Batch {batch}/{batches} starting at review_id={first_id} failed, "
+                "skipping {n} reviews for this run",
                 batch=batch_num,
                 batches=total_batches,
                 first_id=ids[0],
+                n=len(ids),
             )
-            # Sleep before continuing so we don't hammer a broken endpoint.
             await asyncio.sleep(2.0)
             continue
 

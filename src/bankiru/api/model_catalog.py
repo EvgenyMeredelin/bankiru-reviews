@@ -10,7 +10,7 @@ It serves two consumers:
      overflow the context or underutilize it.
 
   2. **UI** (ui/foundation_models.py) — needs the list of available model
-     names to populate the "Cloud model" dropdown in the Gradio interface.
+     names to populate the "Summary model" dropdown in the Gradio interface.
 
 Both consumers share a single cached API response to avoid redundant
 network calls.
@@ -165,7 +165,7 @@ async def list_llm_models(min_context: int = 0) -> list[str]:
     """List model names whose metadata.type is 'llm'.
 
     Optionally filters to models with at least ``min_context`` tokens.
-    Used by the UI to populate the "Cloud model" dropdown with only
+    Used by the UI to populate the "Summary model" dropdown with only
     text-generation models (excluding embedding models, etc.).
 
     Args:

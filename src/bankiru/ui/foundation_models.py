@@ -1,7 +1,7 @@
 """Lazy, fail-soft, TTL-cached LLM list for the UI dropdown.
 
 This module provides a synchronous function (list_foundation_models) that
-returns the list of available LLM models for the "Cloud model" dropdown in
+returns the list of available LLM models for the "Summary model" dropdown in
 the Gradio UI. It wraps the async model_catalog.list_llm_models() function
 with a TTL cache and fail-soft fallback.
 
@@ -20,7 +20,7 @@ Solution:
 Connection to other modules:
   - bankiru.api.model_catalog — provides list_llm_models() (async, TTL-cached)
   - bankiru.ui.blocks         — calls list_foundation_models() to populate
-                                the "Cloud model" dropdown
+                                the "Summary model" dropdown
   - bankiru.config            — provides OPENAI_API_KEY (needed for API access)
 """
 

@@ -35,7 +35,7 @@ from bankiru.config import get_settings
 # before create_all() is called. ReviewEmbedding is imported even though
 # it's not directly referenced in this file — its table definition must
 # be present in the metadata for create_all() to create it.
-from bankiru.models import Base, Review, ReviewEmbedding  # noqa: F811
+from bankiru.models import Base, Review, ReviewEmbedding  # noqa: F401
 
 # ── Module-level singletons ──────────────────────────────────────────────
 # The engine and session maker are lazily initialised on first call to

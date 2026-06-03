@@ -362,7 +362,7 @@ keywords = gr.Textbox(
 │  scale=4        │  scale=4        │  scale=7                 │
 ├─────────────────┼─────────────────┼──────────────────────────┤
 │  Start date     │  Format         │                          │
-│  End date       │  Cloud model    │                          │
+│  End date       │  Summary model  │                          │
 │  Bank           │  Submit         │       Summary            │
 │  Product        │  Clear          │       Markdown panel     │
 │  Location       │  Download btns  │                          │
