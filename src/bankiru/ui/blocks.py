@@ -116,7 +116,7 @@ async def get_reviews(
 #     column, BEFORE the summary slot in the right column) can reference it.
 download_url_box = gr.Textbox(value="", visible=False)
 summary = gr.Markdown(
-    height=390,
+    height=500,
     buttons=["copy"],
     container=True,
     padding=True,
@@ -177,7 +177,7 @@ with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
             # against review embeddings via pgvector cosine similarity.
             keywords = gr.Textbox(
                 label="Keywords",
-                lines=3,
+                lines=2,
                 placeholder="Describe what you're looking for...",
                 value=None,
             )
@@ -201,18 +201,22 @@ with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
             # Collect all input components into a list for event wiring.
             # This list is passed as `inputs` to submit.click() and as
             # `components` to ClearButton.
-            inputs = [start_date, end_date, bank, product, location, keywords, file_format, cloud_model]
+            inputs = [
+                start_date, end_date, bank, product, location, keywords,
+                file_format, cloud_model
+            ]
 
-            # Primary action button: triggers the API call.
-            submit = gr.Button(value="Submit", variant="primary")
-            # Clear button: resets all inputs, the summary, and the download URL.
-            gr.ClearButton(
-                components=inputs + [summary, download_url_box],
-                value="Clear",
-            )
-            # Download buttons: trigger client-side JavaScript (no server round-trip).
-            download_reviews_btn = gr.Button(value="Download reviews")
-            download_summary_btn = gr.Button(value="Download summary")
+            with gr.Group():
+                # Primary action button: triggers the API call.
+                submit = gr.Button(value="Submit", variant="primary")
+                # Clear button: resets all inputs, the summary, and the download URL.
+                gr.ClearButton(
+                    components=inputs + [summary, download_url_box],
+                    value="Clear",
+                )
+                # Download buttons: trigger client-side JavaScript (no server round-trip).
+                download_reviews_btn = gr.Button(value="Download reviews")
+                download_summary_btn = gr.Button(value="Download summary")
 
         # ── Right column: summary display ────────────────────────────
         with gr.Column(scale=7):
