@@ -1,4 +1,27 @@
-"""One daily crawl + POST batch to the API."""
+"""One daily crawl + POST batch to the API.
+
+This module orchestrates a single crawl run: it creates the HTTP client and
+crawler, collects reviews within the configured date window, and POSTs the
+batch to the API service. It is called by the APScheduler cron job in
+__main__.py (via run_once) and can also be invoked manually for backfills.
+
+The run_once() function is the public entry point. It:
+  1. Determines the date window (default: yesterday only)
+  2. Creates a BankiruClient (with warmup) and BankiruCrawler
+  3. Crawls all products within the date window
+  4. POSTs the collected reviews to the API's POST /reviews endpoint
+
+The POST step includes resilience features:
+  - Polls the API healthcheck before attempting the POST (handles API restarts)
+  - Retries the POST indefinitely with exponential backoff (never loses data)
+
+Connection to other modules:
+  - bankiru.parser.__main__  — calls run_once() from the APScheduler cron job
+  - bankiru.parser.client    — provides BankiruClient for HTTP requests
+  - bankiru.parser.crawler   — provides BankiruCrawler for page iteration
+  - bankiru.config           — provides PARSER_DAYS, CREATE_REVIEWS_ENDPOINT,
+                               API_TOKEN settings
+"""
 
 from __future__ import annotations
 
@@ -15,10 +38,13 @@ from bankiru.parser.crawler import BankiruCrawler
 
 logger = logging.getLogger("bankiru.parser.runner")
 
-# Healthcheck polling: wait up to _HEALTHZ_ATTEMPTS × _HEALTHZ_INTERVAL seconds
-# for the API to become ready before starting the POST retry loop.
+# Healthcheck polling constants: the parser waits for the API to be ready
+# before attempting the POST. This handles the case where the API container
+# restarted during the crawl (which can take 30+ minutes).
+# Total wait time: 30 × 5.0 = 150 seconds before giving up on healthcheck
+# (the POST retry loop will handle any remaining unavailability).
 _HEALTHZ_ATTEMPTS = 30
-_HEALTHZ_INTERVAL = 5.0  # seconds between polls
+_HEALTHZ_INTERVAL = 5.0  # seconds between healthcheck polls
 
 
 async def run_once(
@@ -115,12 +141,24 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
     would be wasteful.  The retry loop mirrors the crawl client's philosophy:
     keep trying with exponential back-off (capped at 60 s) until the POST
     succeeds.
+
+    Args:
+        endpoint: Full URL for POST /reviews (e.g. "http://api:1706/reviews")
+        reviews: List of review dicts matching the API's Review schema
+        token: API-Token header value for authentication
     """
+    # The API-Token header authenticates the parser to the API's write
+    # endpoints. The token value comes from the shared API_TOKEN env var.
     headers = {"API-Token": token}
+    # 600s timeout: the API may take a long time to process a large batch
+    # (bulk INSERT + embedding generation + S3 backup).
     async with httpx.AsyncClient(timeout=600.0) as http:
         # Wait for the API to be healthy before attempting the POST.
         await _wait_for_api(http, endpoint)
 
+        # Unlimited retry loop with exponential backoff (capped at 60s).
+        # After spending hours crawling, we never give up on delivering
+        # the batch — the data is too valuable to lose.
         attempt = 0
         while True:
             attempt += 1
@@ -131,7 +169,26 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
                     "POST {endpoint} -> {status}", endpoint=endpoint, status=response.status_code
                 )
                 return
+            except httpx.HTTPStatusError as exc:
+                # Client errors (bad token, wrong URL, invalid payload) will not
+                # succeed on retry — fail fast so the operator sees the problem.
+                # Transient server errors (5xx) and rate limits fall through to
+                # the backoff loop below.
+                if exc.response.status_code in {401, 403, 404, 422}:
+                    logfire.error(
+                        "POST {endpoint} failed with {status}: not retrying",
+                        endpoint=endpoint,
+                        status=exc.response.status_code,
+                    )
+                    raise
+                delay = min(60, 2**attempt)
+                logfire.warning(
+                    "POST attempt={n} failed: {exc} (retry in {delay}s)",
+                    n=attempt, exc=repr(exc), delay=delay,
+                )
+                await asyncio.sleep(delay)
             except httpx.HTTPError as exc:
+                # Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60, ...
                 delay = min(60, 2**attempt)
                 logfire.warning(
                     "POST attempt={n} failed: {exc} (retry in {delay}s)",

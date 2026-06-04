@@ -1,37 +1,77 @@
+# ── Project metadata ────────────────────────────────────────────────────────
+# PEP 621 project table. This is the single source of truth for the
+# package name, version, and dependencies. uv reads this file to resolve
+# and install the project.
 [project]
 name = "bankiru-reviews"
 version = "0.1.0"
 description = "Banki.ru negative reviews stack: parser + DB API in one Dockerized monorepo"
 readme = "README.md"
+# Python 3.13+ is required for modern typing features (e.g. `X | Y` unions)
+# and performance improvements in asyncio.
 requires-python = ">=3.13"
+
+# ── Runtime dependencies ────────────────────────────────────────────────────
+# Each dependency serves a specific role in the stack:
 dependencies = [
+    # S3-compatible async client — uploads exports and daily Parquet backups
     "aiobotocore>=2.24.0",
+    # Cron-like scheduler — drives the daily parser crawl job
     "apscheduler>=3.10.4",
+    # OAuth/OIDC client library — Authentik login flow in the UI service
     "authlib>=1.6.9",
+    # HTML parser — strips tags from review bodies scraped from banki.ru
     "beautifulsoup4>=4.13.4",
+    # Emoji handling — replaces emoji characters in review text
     "emoji>=2.14.1",
+    # Web framework for the API service; [standard] pulls in uvicorn
     "fastapi[standard]>=0.116.1",
+    # Web UI framework — the review query/filter/summary interface
     "gradio>=6.8.0",
+    # Async HTTP client — used by the parser (banki.ru scraping) and UI
     "httpx>=0.27.2",
+    # Cryptographic signing — used by Starlette's SessionMiddleware
     "itsdangerous>=2.2.0",
+    # Observability — structured logging, tracing, and metrics via Logfire
     "logfire[fastapi]>=4.3.3",
+    # Excel engine — required by StyleFrame for .xlsx export
     "openpyxl>=3.1.5",
+    # DataFrame library — serialization to CSV/JSON/Parquet/XLSX formats
     "pandas>=2.3.1",
+    # pgvector SQLAlchemy integration — Vector column type for embeddings
+    "pgvector>=0.4.0",
+    # Async PostgreSQL driver; [binary] avoids compiling C extensions;
+    # [pool] enables connection pooling
     "psycopg[binary,pool]>=3.2.9",
+    # Parquet I/O engine — used by pandas for .parquet export/backup
     "pyarrow>=21.0.0",
+    # Data validation — request/response models throughout the API
     "pydantic>=2.9.0",
+    # LLM agent framework — drives the map-reduce summarizer
     "pydantic-ai>=1.14.1",
+    # Environment-based configuration — Settings class in config.py
     "pydantic-settings>=2.5.0",
+    # Date arithmetic — relativedelta for the parser's date window
     "python-dateutil>=2.9.0.post0",
+    # ORM and async DB engine — all database access goes through SQLAlchemy
     "sqlalchemy>=2.0.43",
+    # Styled Excel export — colour-coded rows in .xlsx output
     "styleframe>=4.2",
+    # Token counting — used by the summarizer to fit text into model context
     "tiktoken>=0.8.0",
+    # IANA timezone database — ensures ZoneInfo works on minimal Docker images
     "tzdata>=2024.2",
 ]
 
+# ── Build system ────────────────────────────────────────────────────────────
+# Hatchling is a lightweight PEP 517 build backend. It reads the [project]
+# table above and produces wheels/sdists.
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Tell hatchling that the importable package lives under src/bankiru
+# (src-layout convention). Without this, hatchling wouldn't find the
+# package because it's not at the repository root.
 [tool.hatch.build.targets.wheel]
 packages = ["src/bankiru"]

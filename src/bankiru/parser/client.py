@@ -57,28 +57,58 @@ def _is_connect_error(exc: BaseException) -> bool:
 
 class BankiruClient:
     """Sequential async HTTP client with randomised pacing and unlimited
-    retry on connect errors."""
+    retry on connect errors.
+
+    This client is the single point of HTTP access for the parser. It wraps
+    httpx.AsyncClient with:
+      - Randomised sleep before every request (ban avoidance)
+      - Rotating User-Agent and Accept-Language headers (fingerprint evasion)
+      - Unlimited retry with exponential backoff on connect errors (ban recovery)
+      - Limited retry on other errors (read timeouts, non-200 status codes)
+      - Cookie jar persistence across requests (session continuity)
+
+    Used by BankiruCrawler (crawler.py) for both listing and detail page fetches.
+    """
 
     def __init__(self) -> None:
+        """Initialise the HTTP client with settings from config.py.
+
+        The httpx client is configured for sequential, single-connection
+        operation with no keepalive — each request opens a fresh TCP
+        connection to avoid server-side throttling on long-lived connections.
+        """
         s = get_settings()
+        # Cache pacing settings as instance attributes for fast access
+        # in the hot loop (avoid repeated get_settings() calls).
         self._sleep_min = s.PARSER_SLEEP_MIN
         self._sleep_max = s.PARSER_SLEEP_MAX
         self._max_retries = s.PARSER_MAX_RETRIES
         self._ban_pause_max = s.PARSER_BAN_PAUSE_MAX
         self._client = httpx.AsyncClient(
+            # HTTP/2 disabled: banki.ru's CDN sometimes behaves differently
+            # with h2; HTTP/1.1 is more predictable for scraping.
             http2=False,
+            # Split timeouts: connect timeout is short (fail fast if blocked),
+            # read timeout is longer (pages can be slow to render).
             timeout=httpx.Timeout(
                 connect=s.PARSER_CONNECT_TIMEOUT,
                 read=s.PARSER_READ_TIMEOUT,
                 write=10.0,
                 pool=5.0,
             ),
+            # Follow redirects automatically (banki.ru sometimes 301/302s).
             follow_redirects=True,
+            # Single connection, no keepalive: each request opens a fresh
+            # TCP connection. This matches the original parser's behaviour
+            # and avoids server-side throttling on persistent connections.
             limits=httpx.Limits(
                 max_connections=1,
                 max_keepalive_connections=0,
                 keepalive_expiry=0,
             ),
+            # Base headers (Accept, Accept-Encoding, Sec-Fetch-*) are shared
+            # across all requests. User-Agent and Accept-Language are rotated
+            # per-request in the get() method.
             headers=BASE_HEADERS,
         )
 
@@ -87,6 +117,12 @@ class BankiruClient:
         return random.uniform(self._sleep_min, self._sleep_max)
 
     async def __aenter__(self) -> "BankiruClient":
+        """Async context manager entry: warm up the session before crawling.
+
+        The warmup() call seeds the cookie jar by visiting the banki.ru
+        homepage. This is important because banki.ru sets session cookies
+        that are required for subsequent page requests to succeed.
+        """
         await self.warmup()
         return self
 
@@ -96,10 +132,21 @@ class BankiruClient:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        """Async context manager exit: close the underlying httpx client."""
         await self._client.aclose()
 
     async def warmup(self) -> None:
-        """Seed the cookie jar. Raises RuntimeError if origin is unreachable."""
+        """Seed the cookie jar by visiting the banki.ru homepage.
+
+        This initial request serves two purposes:
+          1. Populates the httpx cookie jar with session cookies that
+             banki.ru requires for subsequent requests.
+          2. Acts as a connectivity check — if the origin is unreachable,
+             the entire crawl run is aborted early (via RuntimeError)
+             rather than failing on the first real page fetch.
+
+        Raises RuntimeError if the origin is unreachable.
+        """
         with logfire.span("warmup banki.ru session"):
             await asyncio.sleep(self._random_sleep())
             try:
@@ -130,6 +177,9 @@ class BankiruClient:
         the request is abandoned (returns ``None``).
         """
         headers = extra_headers or {}
+        # Track non-connect failures separately from connect errors.
+        # Connect errors (probable bans) are retried indefinitely;
+        # other errors have a finite retry budget.
         non_connect_failures = 0
         ban_streak = 0  # consecutive connect errors (for backoff calculation)
 
@@ -137,8 +187,12 @@ class BankiruClient:
         while True:
             attempt += 1
 
+            # ── Delay calculation ────────────────────────────────────
+            # Two modes: normal pacing vs ban-recovery backoff.
             if ban_streak > 0:
                 # We're in a connect-error streak — use exponential backoff.
+                # Formula: sleep_max * 2^(streak-1), capped at ban_pause_max,
+                # with random jitter ×[0.5, 1.5) to avoid synchronised retries.
                 base = min(
                     self._sleep_max * 2 ** (ban_streak - 1),
                     self._ban_pause_max,
@@ -149,11 +203,14 @@ class BankiruClient:
                 )
             else:
                 # Normal pacing — random sleep in [min, max].
+                # The randomised interval makes traffic look human.
                 delay = self._random_sleep()
 
             await asyncio.sleep(delay)
 
             try:
+                # Rotate User-Agent and Accept-Language on every request
+                # to avoid trivial fingerprinting by the WAF.
                 response = await self._client.get(
                     url,
                     headers={

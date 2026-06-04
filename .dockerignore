@@ -1,17 +1,40 @@
+# ── Docker build context exclusions ─────────────────────────────────────────
+# These patterns tell Docker which files/directories to skip when sending
+# the build context to the daemon. Excluding them reduces the context size,
+# speeds up builds, and prevents secrets or dev artifacts from leaking into
+# the image.
+
+# Python virtual environment — the image builds its own via uv
 .venv/
+
+# Compiled Python bytecode — rebuilt inside the image
 __pycache__/
 *.pyc
+
+# Environment files contain secrets (API keys, DB passwords, etc.).
+# The negation (!.env.example) ensures the template IS included in the
+# context so it can be referenced in documentation or copied into the image.
 .env
 .env.*
 !.env.example
+
+# Version control metadata — not needed inside the container
 .git/
 .gitignore
+
+# uv/pyenv Python version pin — the Dockerfile ARG controls the version
 .python-version
+
+# Test and linter caches — development-only artifacts
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Build artifacts — the image builds from source, not from pre-built wheels
 dist/
 build/
 *.egg-info/
+
+# IDE configuration — developer-specific, not relevant to the container
 .idea/
 .vscode/
