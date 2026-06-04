@@ -446,9 +446,12 @@ async def reindex_embeddings(
     # Step 4: Rebuild the HNSW index with increased maintenance_work_mem
     # for faster index construction. The 2GB setting allows Postgres to
     # use more RAM during the build, significantly speeding up the process
-    # for large tables (380K+ rows).
+    # for large tables (380K+ rows). Disable statement_timeout — building
+    # HNSW on ~380K vectors routinely exceeds the engine default (300 s).
     async with session_maker() as session:
+        await session.execute(text("SET LOCAL statement_timeout = 0"))
         await session.execute(text("SET LOCAL maintenance_work_mem = '2GB'"))
+        logfire.info("Building HNSW index on review_embeddings …")
         await session.execute(
             text(
                 "CREATE INDEX IF NOT EXISTS ix_review_embeddings_hnsw "
@@ -458,6 +461,7 @@ async def reindex_embeddings(
             )
         )
         await session.commit()
+    logfire.info("HNSW index rebuilt")
 
     elapsed = _time.monotonic() - t0
     logfire.info("Reindex complete in {elapsed:.1f}s", elapsed=elapsed)
