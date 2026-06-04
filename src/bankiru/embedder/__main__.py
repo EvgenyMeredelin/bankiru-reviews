@@ -27,7 +27,7 @@ import asyncio
 
 from bankiru.db import get_engine, get_session_maker
 from bankiru.embedder import backfill_embeddings, reindex_embeddings
-from bankiru.logging import configure_logfire, install_auto_tracing
+from bankiru.logging import configure_logfire
 
 
 async def _run_backfill() -> None:
@@ -57,12 +57,12 @@ async def _run_reindex(confirm: bool) -> None:
 def main() -> None:
     """Parse CLI arguments and dispatch to the appropriate command.
 
-    Configures Logfire first so all database and API operations are traced.
+    Configures Logfire for service identity and structured logging. Auto-tracing
+    is not installed here: ``python -m bankiru.embedder`` loads the package
+    ``__init__`` before this module, so Logfire cannot patch it. Explicit
+    spans in ``bankiru.embedder`` cover the important paths.
     """
-    # Configure observability before any work begins.
     configure_logfire(service_name="embedder")
-    # Auto-trace all functions in the embedder module for full visibility.
-    install_auto_tracing(["bankiru.embedder"])
 
     # Build the CLI argument parser with two subcommands.
     parser = argparse.ArgumentParser(

@@ -1,22 +1,23 @@
-"""Logfire setup helpers shared between API and parser services.
+"""Logfire setup helpers shared between services.
 
 Logfire (https://logfire.pydantic.dev/) is the observability backend used by
 this project. It provides structured logging, distributed tracing, and metrics
 via an OpenTelemetry-compatible collector.
 
-Every runnable service calls these two functions at startup:
-  - configure_logfire("api")       — in bankiru/api/__main__.py
-  - configure_logfire("parser")    — in bankiru/parser/__main__.py
-  - configure_logfire("embedder")  — in bankiru/embedder/__main__.py
-  - configure_logfire("ui")        — in bankiru/ui/__main__.py
+Every entrypoint calls ``configure_logfire()`` with a service name:
+  - ``bankiru.api.__main__``     — long-running API (also auto-traces routes/handlers)
+  - ``bankiru.ui.__main__``      — long-running UI (also auto-traces app/blocks)
+  - ``bankiru.parser.__main__``  — long-running parser (explicit spans only)
+  - ``bankiru.embedder.__main__`` — ad-hoc CLI (explicit spans only; no auto-tracing)
 
 The LOGFIRE_TOKEN env var (optional) controls where traces are sent.
 When the token is None, Logfire falls back to local/anonymous mode,
 which is useful for development without a remote collector.
 
-Auto-tracing (install_auto_tracing) instruments every function call in the
-specified modules with zero-code-change spans, giving full call-tree
-visibility in the Logfire dashboard.
+Auto-tracing (``install_auto_tracing``) is used by the API and UI services only.
+It instruments every function call in the listed module paths with zero-code-change
+spans. The embedder CLI cannot auto-trace ``bankiru.embedder`` because
+``python -m bankiru.embedder`` loads the package ``__init__`` before ``__main__``.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ def install_auto_tracing(modules: list[str]) -> None:
     functions are traced — useful for debugging but may increase trace
     volume in production. Adjust if trace costs become a concern.
 
-    Called at service startup alongside configure_logfire(). Each service
+    Called at API/UI startup alongside configure_logfire(). Each service
     traces only its own module subtree to avoid redundant instrumentation.
     """
     # min_duration=0 traces every call (even sub-millisecond helpers). Good for

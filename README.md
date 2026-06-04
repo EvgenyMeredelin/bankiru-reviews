@@ -631,7 +631,7 @@ bankiru-reviews/
     │   └── botocore_client.py      # aiobotocore async S3 client factory
     ├── embedder/
     │   ├── __init__.py             # embed_texts(), format_review_for_embedding(), backfill_embeddings(), reindex_embeddings()
-    │   └── __main__.py             # CLI (not a Compose service): backfill | reindex [--confirm]
+    │   └── __main__.py             # CLI: backfill | reindex [--confirm]; configure_logfire only
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
     │   ├── runner.py               # run_once(days=N); POST with unlimited retry
@@ -1039,7 +1039,7 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 
 ### Наблюдаемость и расширяемость
 
-**Logfire:** имена сервисов `api`, `parser`, `ui`, `embedder`; auto-tracing для модулей API и UI; парсер — явные spans.
+**Logfire:** имена сервисов `api`, `parser`, `ui`, `embedder`; auto-tracing — модули API и UI; парсер и embedder CLI — явные spans.
 
 **Новый формат выгрузки:** подкласс `*Maker` в `handlers.py`; регистрация автоматическая через `inspect.getmembers` в `schemas.py`.
 
