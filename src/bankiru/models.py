@@ -69,9 +69,10 @@ class Review(Base):
 
 
 # ── Review embeddings table ─────────────────────────────────────────────
-# Stores vector embeddings for semantic search (the "Keywords" field in the UI).
-# Each row holds a 1024-dimensional BAAI/bge-m3 embedding of the corresponding
-# review's reviewBody text.
+# Stores vector embeddings for semantic search (the "Semantic search" field in the UI).
+# Each row holds a 1024-dimensional BAAI/bge-m3 embedding of enriched passage text:
+# ``{bankName} | {product} | {location}\n{reviewBody}`` with the BGE-M3 passage prefix
+# applied at embed time (see embedder.format_review_for_embedding).
 #
 # Design decisions:
 #   - One-to-one relationship with Review via review_id (PK + FK).

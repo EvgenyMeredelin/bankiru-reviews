@@ -18,7 +18,7 @@
 ```mermaid
 flowchart TD
     subgraph UI [Gradio UI]
-        keywords[Keywords textarea]
+        keywords[Semantic search textbox]
         filters[Existing filters]
     end
 
@@ -234,7 +234,7 @@ EMBEDDINGS_BATCH_SIZE=50
 # DB rows fetched per backfill iteration (each iteration makes
 # EMBEDDINGS_BACKFILL_BATCH / EMBEDDINGS_BATCH_SIZE API calls)
 EMBEDDINGS_BACKFILL_BATCH=500
-# Max reviews returned when Keywords field is used
+# Max reviews returned when Semantic search field is used
 SEMANTIC_SEARCH_LIMIT=200
 ```
 
@@ -249,7 +249,7 @@ When `keywords` parameter is present:
 ```mermaid
 flowchart TD
     A[Receive GET /reviews with keywords + filters] --> B[Build scalar WHERE clauses - same as today]
-    B --> C[Embed keywords via embed_texts]
+    B --> C["Embed query via embed_texts (mode=query)"]
     C --> D[Execute hybrid query:\nJOIN reviews + review_embeddings\nWHERE scalar filters\nORDER BY cosine distance\nLIMIT SEMANTIC_SEARCH_LIMIT]
     D --> E{Results found?}
     E -->|Yes| F[Proceed to export + summarize as usual]
@@ -270,6 +270,8 @@ WHERE r."datePublished" >= :start
   -- ... other scalar filters ...
 ORDER BY e.embedding <=> :query_vector
 LIMIT :semantic_search_limit;
+-- Before the query: SET LOCAL hnsw.ef_search = :ef_search (SEMANTIC_SEARCH_EF_SEARCH).
+-- Optional: AND (e.embedding <=> :query_vector) <= :max_distance when SEMANTIC_SEARCH_MAX_DISTANCE is set.
 ```
 
 The `<=>` operator is pgvector's cosine distance. The HNSW index accelerates this even with the scalar pre-filter (Postgres applies the WHERE first, then uses the index for ordering).
@@ -296,8 +298,8 @@ When keywords are provided, cap results at `SEMANTIC_SEARCH_LIMIT` (default 200)
 
 After the bulk INSERT into `bankiru.reviews`:
 
-1. Collect the `reviewBody` texts and their assigned `id`s
-2. Call `embed_texts()` in sub-batches of `EMBEDDINGS_BATCH_SIZE` (50)
+1. Collect enriched passage texts via `format_review_for_embedding()` and their assigned `id`s
+2. Call `embed_texts(..., mode="passage")` in sub-batches of `EMBEDDINGS_BATCH_SIZE` (50)
 3. Bulk INSERT into `bankiru.review_embeddings`
 4. If embedding fails, log a warning but do NOT fail the review insert (embeddings can be backfilled later)
 
@@ -305,7 +307,7 @@ After the bulk INSERT into `bankiru.reviews`:
 flowchart TD
     A[POST /reviews] --> B[Bulk INSERT into reviews]
     B --> C[Retrieve inserted IDs]
-    C --> D[Batch embed reviewBody texts]
+    C --> D["Batch embed enriched passages (mode=passage)"]
     D --> E{Embedding succeeded?}
     E -->|Yes| F[Bulk INSERT into review_embeddings]
     E -->|No| G[Log warning - reviews saved without embeddings]
@@ -340,19 +342,20 @@ At API startup (in the lifespan handler), after `create_all_tables()`:
 
 ## 10. Frontend Changes
 
-### 10.1 Keywords textarea in `blocks.py`
+### 10.1 Semantic search field in `blocks.py`
 
-Add directly below the `location` dropdown in the left column:
+Implemented below the `location` dropdown in the left column (UI label **Semantic search**; API param remains `keywords`):
 
 ```python
-# In the left column (scale=4), after location dropdown:
 keywords = gr.Textbox(
-    label="Keywords",
-    lines=3,
+    label="Semantic search",
+    lines=1,
     placeholder="Describe what you're looking for...",
     value=None,
 )
 ```
+
+Ocean theme uses `radius_size="none"` in `app.py`; custom CSS squares dropdowns, textboxes, and the Summary accordion.
 
 ### 10.2 Updated layout
 
@@ -366,14 +369,14 @@ keywords = gr.Textbox(
 │  Bank           │  Submit         │       Summary            │
 │  Product        │  Clear          │       Markdown panel     │
 │  Location       │  Download btns  │                          │
-│  Keywords - NEW │                 │                          │
-│  3-row textarea │                 │                          │
+│  Semantic search│                 │                          │
+│  1-line textbox │                 │                          │
 └─────────────────┴─────────────────┴──────────────────────────┘
 ```
 
-### 10.3 Wire up the Keywords input
+### 10.3 Wire up the semantic search input
 
-- Add `keywords` to the `inputs` list
+- Add `keywords` to the `inputs` list (Gradio variable name; API param `keywords`)
 - Add `keywords` parameter to `get_reviews()` function signature
 - Include `keywords` in the API call params dict
 - Add `keywords` to the `ClearButton` components list
@@ -494,7 +497,7 @@ flowchart TD
 | `src/bankiru/api/schemas.py` | Modify | Add `keywords: str \| None` to `Request` |
 | `src/bankiru/api/routes.py` | Modify | Add semantic search branch in `get_reviews()`; embed on `post_reviews()` |
 | `src/bankiru/api/app.py` | Modify | Launch backfill background task in lifespan |
-| `src/bankiru/ui/blocks.py` | Modify | Add Keywords textarea; wire to inputs and `get_reviews()` |
+| `src/bankiru/ui/blocks.py` | Modify | Add Semantic search textbox; wire to inputs and `get_reviews()` |
 | `.env.example` | Modify | Add `EMBEDDINGS_*` and `SEMANTIC_SEARCH_LIMIT` env vars |
 | `pyproject.toml` | Modify | Add `pgvector` dependency |
 | `README.md` | Modify | Document semantic search, reindex CLI, new env vars, pgvector setup |
@@ -534,6 +537,6 @@ flowchart TD
 9. Update `api/app.py`: launch backfill background task in lifespan (imports from embedder package)
 10. Update `api/schemas.py`: add `keywords` field to `Request`
 11. Update `api/routes.py`: hybrid search in `get_reviews()`, embed in `post_reviews()`
-12. Update `ui/blocks.py`: add Keywords textarea, wire to inputs and API call
+12. Update `ui/blocks.py`: add Semantic search textbox, wire to inputs and API call
 13. Update `README.md` with semantic search + reindex documentation
-14. Test end-to-end: backfill, reindex dry-run, reindex --confirm, insert with embedding, keyword search
+14. Test end-to-end: backfill, reindex dry-run, reindex --confirm, insert with embedding, semantic search

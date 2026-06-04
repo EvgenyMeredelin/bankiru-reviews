@@ -46,7 +46,7 @@ from bankiru.api import schemas
 from bankiru.api.deps import BotoClient, DBSession, api_token
 from bankiru.api.schemas import Request, Response, available_output_formats
 from bankiru.config import get_settings
-from bankiru.embedder import embed_texts
+from bankiru.embedder import embed_texts, format_review_for_embedding
 from bankiru.models import Review, ReviewEmbedding
 
 # All routes are registered on this router, which is included in the
@@ -176,7 +176,13 @@ async def post_reviews(
             # embeddings (e.g. duplicate URLs that existed before this batch).
             urls = [r.url for r in reviews]
             id_stmt = (
-                select(Review.id, Review.reviewBody)
+                select(
+                    Review.id,
+                    Review.bankName,
+                    Review.product,
+                    Review.location,
+                    Review.reviewBody,
+                )
                 .outerjoin(ReviewEmbedding, ReviewEmbedding.review_id == Review.id)
                 .where(Review.url.in_(urls), ReviewEmbedding.review_id.is_(None))
             )
@@ -185,8 +191,16 @@ async def post_reviews(
 
             if id_rows:
                 review_ids = [row.id for row in id_rows]
-                texts = [row.reviewBody for row in id_rows]
-                vectors = await embed_texts(texts)
+                texts = [
+                    format_review_for_embedding(
+                        bank_name=row.bankName,
+                        product=row.product,
+                        location=row.location,
+                        review_body=row.reviewBody,
+                    )
+                    for row in id_rows
+                ]
+                vectors = await embed_texts(texts, mode="passage")
 
                 embedding_rows = [
                     {"review_id": rid, "embedding": vec}
@@ -257,23 +271,27 @@ async def get_reviews(
         if r.product:
             clauses.append(Review.product.in_(r.product))
 
-        # ── Semantic search path (keywords provided) ─────────────────
-        # When the user provides keywords, we embed the query text and
+        # ── Semantic search path (keywords query param) ──────────────
+        # When a semantic search query is provided, embed it and find the
         # find the most similar reviews using pgvector cosine distance.
         # The result is ordered by similarity (closest first) and capped
         # at SEMANTIC_SEARCH_LIMIT reviews.
         if r.keywords and r.keywords.strip():
-            with logfire.span("Embed keywords"):
+            search_settings = get_settings()
+            with logfire.span("Embed semantic search query"):
                 try:
                     # Embed the user's query text into a vector using the
                     # same model that was used to embed the review texts.
-                    query_vectors = await embed_texts([r.keywords.strip()])
+                    query_vectors = await embed_texts(
+                        [r.keywords.strip()],
+                        mode="query",
+                    )
                 except Exception as exc:
                     logfire.warning(
-                        "Failed to embed keywords: {exc}", exc=str(exc),
+                        "Failed to embed semantic search query: {exc}", exc=str(exc),
                     )
                     # Fail gracefully: return an error message instead of
-                    # crashing. The user can retry without keywords.
+                    # crashing. The user can retry without a semantic search query.
                     return Response(
                         **r.model_dump(),
                         comment=f"Semantic search unavailable: {exc}",
@@ -281,6 +299,18 @@ async def get_reviews(
                 query_vector = query_vectors[0]
 
             with logfire.span("Semantic search with filters"):
+                # Higher ef_search improves HNSW recall during approximate search.
+                # Use a validated literal — PostgreSQL SET does not accept bind params.
+                ef_search = max(1, search_settings.SEMANTIC_SEARCH_EF_SEARCH)
+                await session.execute(
+                    text(f"SET LOCAL hnsw.ef_search = {ef_search}"),
+                )
+                distance = ReviewEmbedding.embedding.cosine_distance(query_vector)
+                search_clauses = list(clauses)
+                if search_settings.SEMANTIC_SEARCH_MAX_DISTANCE is not None:
+                    search_clauses.append(
+                        distance <= search_settings.SEMANTIC_SEARCH_MAX_DISTANCE
+                    )
                 # JOIN reviews with their embeddings, apply all filter
                 # clauses, then ORDER BY cosine distance (ascending =
                 # most similar first). The HNSW index on the embedding
@@ -288,13 +318,13 @@ async def get_reviews(
                 statement = (
                     select(Review)
                     .join(ReviewEmbedding, ReviewEmbedding.review_id == Review.id)
-                    .where(*clauses)
-                    .order_by(ReviewEmbedding.embedding.cosine_distance(query_vector))
-                    .limit(get_settings().SEMANTIC_SEARCH_LIMIT)
+                    .where(*search_clauses)
+                    .order_by(distance)
+                    .limit(search_settings.SEMANTIC_SEARCH_LIMIT)
                 )
                 result = await session.execute(statement)
         else:
-            # ── Standard path (no keywords) ──────────────────────────
+            # ── Standard path (no semantic search query) ─────────────
             # Return all matching reviews sorted by date, URL, and product.
             # No limit — the full result set is exported.
             sort_order = [Review.datePublished, Review.url, Review.product]

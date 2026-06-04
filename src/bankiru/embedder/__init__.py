@@ -13,12 +13,18 @@ This module provides three main capabilities:
      run manually via ``python -m bankiru.embedder backfill``.
 
   3. **reindex_embeddings()** — Drops all existing embeddings and rebuilds
-     them from scratch. Useful when changing the embedding model or
-     dimensions. Run via ``python -m bankiru.embedder reindex --confirm``.
+     them from scratch. Useful when changing the embedding model,
+     dimensions, or passage format. Run via
+     ``python -m bankiru.embedder reindex --confirm``.
+
+  4. **format_review_for_embedding()** — Builds enriched passage text
+     (``bankName | product | location`` + review body) for storage vectors.
 
 The embedding model (BAAI/bge-m3) produces 1024-dimensional vectors that
 are stored in the review_embeddings table (pgvector Vector(1024) column).
-These vectors enable semantic search via cosine similarity in GET /reviews.
+BGE-M3 query/passage prefixes are applied in ``embed_texts()`` so search
+queries and stored passages use asymmetric encoding. These vectors enable
+semantic search via cosine similarity in GET /reviews.
 
 Connection to other modules:
   - bankiru.api.routes     — calls embed_texts() for POST /reviews (new review
@@ -35,7 +41,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time as _time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
 import httpx
 import logfire
@@ -57,16 +63,49 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+# BGE-M3 retrieval instructions (asymmetric query vs passage encoding).
+_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+_PASSAGE_PREFIX = "Represent this document for retrieval: "
+
+
+def format_review_for_embedding(
+    *,
+    bank_name: str,
+    product: str,
+    location: str,
+    review_body: str,
+) -> str:
+    """Build passage text for embedding: metadata header + review body."""
+    parts = [bank_name, product]
+    loc = location.strip()
+    if loc:
+        parts.append(loc)
+    return f"{' | '.join(parts)}\n{review_body}"
+
+
+def _apply_embedding_mode(text: str, mode: Literal["query", "passage"]) -> str:
+    prefix = _QUERY_PREFIX if mode == "query" else _PASSAGE_PREFIX
+    return prefix + text
+
+
 # ---------------------------------------------------------------------------
 # Core embedding function
 # ---------------------------------------------------------------------------
 
-async def embed_texts(texts: list[str]) -> list[list[float]]:
+async def embed_texts(
+    texts: list[str],
+    *,
+    mode: Literal["query", "passage"] = "passage",
+) -> list[list[float]]:
     """Call the OpenAI-compatible ``/v1/embeddings`` endpoint in batches.
 
     Splits the input texts into sub-batches of EMBEDDINGS_BATCH_SIZE (default 50)
     and sends each sub-batch as a single API call. This is more efficient than
     one-text-per-call and avoids hitting request size limits.
+
+    Applies BGE-M3 retrieval prefixes via *mode* before calling the API:
+      - ``query`` — user search strings (GET /reviews semantic search)
+      - ``passage`` — review documents (POST /reviews, backfill, reindex)
 
     Returns a flat list of embedding vectors in the same order as *texts*.
     Retries on 429 (rate limit) / 5xx (server error) up to 3 times with
@@ -74,6 +113,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
 
     Args:
         texts: List of text strings to embed.
+        mode: BGE-M3 encoding mode (query vs passage prefix).
 
     Returns:
         List of float vectors, one per input text, in the same order.
@@ -83,6 +123,8 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         httpx.HTTPStatusError: If the API returns a non-retryable error.
     """
     settings = get_settings()
+    if texts:
+        texts = [_apply_embedding_mode(t, mode) for t in texts]
 
     # Fall back to the general OpenAI key if no embeddings-specific key is set.
     # This allows using a different provider/key for embeddings vs summaries.
@@ -237,7 +279,13 @@ async def backfill_embeddings(
         # the oldest un-embedded reviews first).
         async with session_maker() as session:
             stmt = (
-                select(Review.id, Review.reviewBody)
+                select(
+                    Review.id,
+                    Review.bankName,
+                    Review.product,
+                    Review.location,
+                    Review.reviewBody,
+                )
                 .outerjoin(
                     ReviewEmbedding, ReviewEmbedding.review_id == Review.id,
                 )
@@ -257,12 +305,20 @@ async def backfill_embeddings(
 
         batch_num += 1
         ids = [r.id for r in rows]
-        texts = [r.reviewBody for r in rows]
+        texts = [
+            format_review_for_embedding(
+                bank_name=r.bankName,
+                product=r.product,
+                location=r.location,
+                review_body=r.reviewBody,
+            )
+            for r in rows
+        ]
 
         try:
             # Generate embeddings for this batch of review texts.
             # embed_texts() handles sub-batching internally.
-            vectors = await embed_texts(texts)
+            vectors = await embed_texts(texts, mode="passage")
         except Exception:
             # Skip this batch for the rest of this run so a persistent failure
             # does not spin forever. Rows stay un-embedded until the next backfill.
@@ -344,6 +400,7 @@ async def reindex_embeddings(
     Use cases:
       - Changing the embedding model (e.g. from bge-m3 to a newer model)
       - Changing the vector dimensions
+      - Changing the passage format (enriched metadata + BGE-M3 prefixes)
       - Recovering from corrupted embeddings
     """
     # ── Dry-run: show what would happen without making changes ────────

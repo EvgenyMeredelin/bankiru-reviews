@@ -29,6 +29,24 @@ from pydantic import BeforeValidator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
+def _parse_optional_float(value: object) -> float | None:
+    """Parse an optional float from env; empty or ``none`` → ``None``.
+
+    Lets operators disable ``SEMANTIC_SEARCH_MAX_DISTANCE`` by leaving the
+    variable unset, blank, or set to ``none`` (as documented in .env.example).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip().lower()
+        if stripped == "" or stripped == "none":
+            return None
+    parsed = float(value)  # type: ignore[arg-type]
+    if parsed < 0:
+        raise ValueError("must be >= 0")
+    return parsed
+
+
 def _split_csv(value: object) -> list[str]:
     """Split a comma-separated string into a stripped list; passthrough for lists.
 
@@ -149,7 +167,7 @@ class Settings(BaseSettings):
 
     # ── Embeddings (Cloud.ru Foundation Models, OpenAI-compatible) ───────
     # Settings for generating vector embeddings of review texts, used for
-    # semantic search (the "Keywords" field in the UI). The embedder service
+    # semantic search (the "Semantic search" field in the UI). The embedder service
     # and the API's GET /reviews?keywords=... endpoint both use these.
     EMBEDDINGS_MODEL: str = "BAAI/bge-m3"
     # Separate base URL and API key for the embeddings endpoint. When None,
@@ -165,8 +183,14 @@ class Settings(BaseSettings):
     # ceil(EMBEDDINGS_BACKFILL_BATCH / EMBEDDINGS_BATCH_SIZE) API calls.
     EMBEDDINGS_BACKFILL_BATCH: int = 500          # DB rows per backfill iteration
     # Maximum number of reviews returned when the user provides a semantic
-    # search query (keywords). Caps the result set to keep response times fast.
-    SEMANTIC_SEARCH_LIMIT: int = 200              # max results when keywords are used
+    # search query. Caps the result set to keep response times fast.
+    SEMANTIC_SEARCH_LIMIT: int = 200
+    # pgvector HNSW recall knob at query time (default in pgvector is 40).
+    SEMANTIC_SEARCH_EF_SEARCH: int = 100
+    # Cosine distance ceiling for semantic results; None disables the floor.
+    SEMANTIC_SEARCH_MAX_DISTANCE: Annotated[
+        float | None, BeforeValidator(_parse_optional_float)
+    ] = 0.55
 
     # ── UI service ───────────────────────────────────────────────────────
     # Port the Gradio UI server listens on. Bound to 127.0.0.1 on the host

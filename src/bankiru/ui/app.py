@@ -252,22 +252,32 @@ def create_app() -> FastAPI:
         blocks=gradio_ui,
         path="/gradio",
         auth_dependency=get_user,
-        # Ocean theme with zero button radius — rectangular buttons match the
-        # rest of the layout (Gradio's default is heavily rounded).
-        theme=gr.themes.Ocean().set(
+        # Ocean theme with zero radius — rectangular controls match the layout
+        # (Gradio's default Ocean theme is heavily rounded).
+        theme=gr.themes.Ocean(radius_size="none").set(
             button_large_radius="0px",
             button_medium_radius="0px",
             button_small_radius="0px",
+            input_radius="0px",
+            block_radius="0px",
+            container_radius="0px",
+            block_label_radius="0px",
         ),
         # Custom CSS injected into the Gradio mount:
         #   - hide the "Built with Gradio" footer
         #   - match summary panel bottom inset to horizontal block padding
-        #     (elem_id is set on the Markdown component in blocks.py)
+        #   - square corners on dropdowns/textboxes/accordion if theme tokens miss inner chrome
         css="""
 footer {visibility: hidden}
 #summary-panel.block.padded,
 #summary-panel .padding {
     padding-bottom: calc(var(--spacing-xl) + 2px);
+}
+input, textarea, select, .wrap, .multiselect, .input-container {
+    border-radius: 0 !important;
+}
+.accordion, .accordion > button, details, summary {
+    border-radius: 0 !important;
 }
 """,
     )

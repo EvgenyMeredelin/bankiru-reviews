@@ -127,7 +127,7 @@ summary = gr.Markdown(
 
 # ── Gradio Blocks layout ────────────────────────────────────────────────────
 # The layout is a three-column design:
-#   Left column (scale=4):  filter inputs (dates, bank, product, location, keywords)
+#   Left column (scale=4):  filter inputs (dates, bank, product, location, semantic search)
 #   Middle column (scale=4): format/model selection, action buttons
 #   Right column (scale=7):  summary display (Markdown with copy button)
 #
@@ -186,7 +186,7 @@ with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
             # Semantic search: free-text query that is embedded and compared
             # against review embeddings via pgvector cosine similarity.
             keywords = gr.Textbox(
-                label="Keywords",
+                label="Semantic search",
                 lines=1,
                 placeholder="Describe what you're looking for...",
                 value=None,
