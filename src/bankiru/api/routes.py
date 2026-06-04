@@ -209,6 +209,10 @@ async def post_reviews(
                 await session.execute(insert(ReviewEmbedding), embedding_rows)
                 await session.commit()
         except Exception as exc:
+            # Rollback the failed embedding INSERT so the session is clean
+            # for any subsequent operations and for proper cleanup by the
+            # FastAPI dependency injection teardown.
+            await session.rollback()
             logfire.warning(
                 "embedding failed for POST batch, will be backfilled: {exc}",
                 exc=str(exc),
@@ -273,7 +277,7 @@ async def get_reviews(
 
         # ── Semantic search path (keywords query param) ──────────────
         # When a semantic search query is provided, embed it and find the
-        # find the most similar reviews using pgvector cosine distance.
+        # most similar reviews using pgvector cosine distance.
         # The result is ordered by similarity (closest first) and capped
         # at SEMANTIC_SEARCH_LIMIT reviews.
         if r.keywords and r.keywords.strip():
@@ -301,7 +305,8 @@ async def get_reviews(
             with logfire.span("Semantic search with filters"):
                 # Higher ef_search improves HNSW recall during approximate search.
                 # Use a validated literal — PostgreSQL SET does not accept bind params.
-                ef_search = max(1, search_settings.SEMANTIC_SEARCH_EF_SEARCH)
+                # Explicit int() cast provides defense-in-depth against injection.
+                ef_search = int(max(1, search_settings.SEMANTIC_SEARCH_EF_SEARCH))
                 await session.execute(
                     text(f"SET LOCAL hnsw.ef_search = {ef_search}"),
                 )

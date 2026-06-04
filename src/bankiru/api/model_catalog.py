@@ -120,28 +120,30 @@ async def _ensure_cache() -> _CatalogCache:
 
     now = time.monotonic()
     # Fast path: cache is valid, return immediately without locking.
-    if _cache is None or _cache.expires_at <= now:
-        async with _cache_lock:
-            # Re-check inside the lock — another coroutine may have
-            # refreshed the cache while we were waiting for the lock.
-            if _cache is None or _cache.expires_at <= now:
-                try:
-                    contexts, entries = await _fetch_catalog()
-                    _cache = _CatalogCache(
-                        expires_at=now + _TTL_SECONDS,
-                        contexts=contexts,
-                        entries=entries,
-                    )
-                except Exception as exc:
-                    # Fail-soft: log the error and create a short-lived cache
-                    # with empty data. Callers will get the default context
-                    # size, and the cache will be retried in 60 seconds.
-                    logfire.warning(
-                        "model catalog fetch failed, using default {default}",
-                        default=default, exc=str(exc),
-                    )
-                    _cache = _CatalogCache(expires_at=now + 60, contexts={})
+    if _cache is not None and _cache.expires_at > now:
+        return _cache
 
+    async with _cache_lock:
+        # Re-check inside the lock — another coroutine may have
+        # refreshed the cache while we were waiting for the lock.
+        if _cache is not None and _cache.expires_at > now:
+            return _cache
+        try:
+            contexts, entries = await _fetch_catalog()
+            _cache = _CatalogCache(
+                expires_at=now + _TTL_SECONDS,
+                contexts=contexts,
+                entries=entries,
+            )
+        except Exception as exc:
+            # Fail-soft: log the error and create a short-lived cache
+            # with empty data. Callers will get the default context
+            # size, and the cache will be retried in 60 seconds.
+            logfire.warning(
+                "model catalog fetch failed, using default {default}",
+                default=default, exc=str(exc),
+            )
+            _cache = _CatalogCache(expires_at=now + 60, contexts={})
     return _cache
 
 

@@ -344,8 +344,12 @@ async def summarize_map_reduce(texts: list[str], *, model_name: str) -> str:
     except ModelHTTPError as error:
         # LLM provider returned an HTTP error (e.g. 429 rate limit, 500).
         # Extract the human-readable message from the error body.
-        body = error.body or {}
-        return body.get("message", str(error))
+        # error.body may be None, a dict, a string, or another type —
+        # guard with isinstance before calling .get().
+        body = error.body
+        if isinstance(body, dict):
+            return body.get("message", str(error))
+        return str(body) if body else str(error)
 
     except UsageLimitExceeded as error:
         # The LLM exceeded the output token limit we set.

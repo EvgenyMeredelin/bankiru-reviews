@@ -42,6 +42,7 @@
 - [Quick start](#quick-start)
 - [Day-2 operations](#day-2-operations)
 - [Описание проекта (на русском)](#описание-проекта-на-русском)
+- [Краткое описание (на русском)](#краткое-описание-на-русском)
 - [References](#references)
 
 ---
@@ -63,7 +64,7 @@ flowchart TD
 
     nginx -->|"127.0.0.1:17060"| ui
     ui <-->|"OIDC"| authentik(("Authentik"))
-    api -->|"SQLAlchemy"| postgres[("Postgres\nbankiru.reviews")]
+    api -->|"SQLAlchemy"| postgres[("Postgres\nreviews + embeddings")]
     api -->|"put_object\npresigned_url"| s3[("S3 / OBS")]
     parser -->|"sequential HTTP/1.1\nbackoff + retry"| bankiruRu[("banki.ru")]
     infisical(("Infisical")) -.->|"secrets via tmpfs\n/dev/shm/...env"| stack
@@ -82,10 +83,10 @@ flowchart TD
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Spawns a background embedding backfill on startup. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
+| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. On startup: `create_all_tables()` (blocks while building a missing HNSW index), then a background embedding backfill. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
 | `parser` | Same image, `command: python -m bankiru.parser` | APScheduler cron job. Crawls banki.ru once daily, collects negative reviews for the previous `PARSER_DAYS` days, and POSTs the deduplicated batch to the `api`. |
 | `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
-| External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is bootstrapped at `api` startup via `create_all_tables()` (pgvector extension, ORM tables, B-tree indexes, HNSW vector index — all idempotent). |
+| External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is bootstrapped at `api` startup via `create_all_tables()` (pgvector extension, ORM tables, B-tree indexes, HNSW index via `ensure_hnsw_index()` — idempotent when valid; building a missing HNSW index blocks readiness). |
 | External: S3 / OBS | (managed elsewhere) | Stores named export files (pre-signed 1-hour URLs) and daily Parquet backups (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`). |
 | External: Authentik | `https://uva-advanced.ru` | OIDC identity provider for the UI login flow. |
 | External: Infisical | `https://infisical.uva-advanced.ru` | Secrets store; `scripts/start.sh` pulls secrets into `/dev/shm` at boot. |
@@ -269,7 +270,7 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 ## Parser — crawl mechanics
 
-**Products covered:** 24 URL slugs mapping to 23 distinct product labels (12 retail + 12 business). Defined in `parser/settings.py` as a `{slug: label}` dict. Note: banki.ru uses both `corporate` and `legal` slugs for "Обслуживание юридических лиц" — both are crawled and the crawler's in-memory deduplication discards the duplicate bodies.
+**Products covered:** 24 URL slugs mapping to 23 distinct product labels (12 retail + 11 business). Defined in `parser/settings.py` as a `{slug: label}` dict. Note: banki.ru uses both `corporate` and `legal` slugs for "Обслуживание юридических лиц" — both are crawled and the crawler's in-memory deduplication discards the duplicate bodies.
 
 **Crawl loop (per product):**
 
@@ -469,21 +470,28 @@ When Semantic search is empty, the query path is unchanged — all matching revi
 - **New reviews:** Embedded inline during `POST /reviews` using enriched passage text. If embedding fails, the review is saved without an embedding and will be backfilled later.
 - **Startup backfill:** At API startup, a background task embeds any reviews that don't yet have embeddings. A batch that fails repeatedly is skipped for the rest of that run (avoiding an infinite loop); those rows are retried on the next restart or via the CLI.
 - **Reindex CLI:** `python -m bankiru.embedder reindex --confirm` regenerates all embeddings from scratch (required after changing embedding format or model). The embedder is a **CLI module**, not a long-lived Compose service — run it with `docker exec bankiru-api`.
+- **Build-index CLI:** `python -m bankiru.embedder build-index` creates the HNSW index on existing embeddings only (no re-embed). Use when vectors are present but the index is missing or invalid (~15–45+ min for ~380K rows). API startup also calls this via `ensure_hnsw_index()` and **blocks until the index is ready**.
 
-### Reindexing
+### Embedder CLI
 
 ```bash
-# Dry-run — show what would happen
-docker exec bankiru-api python -m bankiru.embedder reindex
-
-# Full reindex — TRUNCATE + re-embed all reviews (~1 hour for ~380K rows)
-docker exec bankiru-api python -m bankiru.embedder reindex --confirm
-
 # Backfill only — embed reviews missing embeddings
 docker exec bankiru-api python -m bankiru.embedder backfill
+
+# Build HNSW index only — no re-embed (recovery after failed reindex)
+docker exec bankiru-api python -m bankiru.embedder build-index
+docker exec bankiru-api python -m bankiru.embedder build-index --force  # drop + rebuild
+
+# Dry-run — show what reindex would do
+docker exec bankiru-api python -m bankiru.embedder reindex
+
+# Full reindex — TRUNCATE + re-embed all reviews (~1 hour for ~380K rows) + index build
+docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 ```
 
 **After deploying embedding-quality changes:** run `reindex --confirm` once so existing vectors use the same enriched passage format as new inserts. New reviews pick up the improved format immediately; old vectors stay stale until reindex completes.
+
+**If reindex finished embedding but failed on index creation:** run `build-index` — do **not** re-run `reindex --confirm`.
 
 ### Pre-deploy checklist
 
@@ -510,13 +518,11 @@ docker exec bankiru-api python -m bankiru.embedder backfill
    docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env up -d --force-recreate api parser ui
    ```
 
-4. **Monitor the backfill:**
+4. **Monitor startup** (HNSW index build + backfill):
    ```bash
    docker logs bankiru-api -f
    ```
-   The API auto-creates the `review_embeddings` table and starts backfilling ~380K reviews.
-   Progress is logged every batch (~500 reviews). Expect ~63 minutes for the initial backfill.
-   Subsequent restarts skip the backfill (all rows already embedded).
+   On first deploy the API **blocks readiness** while it builds the HNSW index on existing embeddings (~15–45+ min for ~380K rows if vectors are already present; skipped when the index is valid). After that it auto-creates the `review_embeddings` table (if needed) and starts backfilling ~380K reviews in the background. Progress is logged every batch (~500 reviews). Expect ~63 minutes for the initial backfill. Subsequent restarts skip both index rebuild (when valid) and backfill (when all rows are embedded).
 
 ---
 
@@ -617,11 +623,11 @@ bankiru-reviews/
     ├── __init__.py                 # __version__ = "0.1.0"
     ├── config.py                   # Pydantic Settings; all env vars in one place
     ├── logging.py                  # configure_logfire() + install_auto_tracing()
-    ├── db.py                       # async SQLAlchemy engine, session factory, create_all; statement_timeout
+    ├── db.py                       # async SQLAlchemy engine, session factory, create_all_tables(), ensure_hnsw_index()
     ├── models.py                   # Review + ReviewEmbedding ORM (schema="bankiru"); indexes; review_columns list
     ├── api/
     │   ├── __main__.py             # uvicorn entry; auto-traces api.routes + api.handlers
-    │   ├── app.py                  # FastAPI factory; lifespan runs create_all_tables + backfill_embeddings
+    │   ├── app.py                  # FastAPI factory; lifespan: create_all_tables (blocks on HNSW) + backfill task
     │   ├── routes.py               # GET/POST/DELETE /reviews; GET /healthz
     │   ├── deps.py                 # DBSession, BotoClient, api_token type aliases
     │   ├── schemas.py              # Pydantic Request / Response / Review; format registry
@@ -631,7 +637,7 @@ bankiru-reviews/
     │   └── botocore_client.py      # aiobotocore async S3 client factory
     ├── embedder/
     │   ├── __init__.py             # embed_texts(), format_review_for_embedding(), backfill_embeddings(), reindex_embeddings()
-    │   └── __main__.py             # CLI: backfill | reindex [--confirm]; configure_logfire only
+    │   └── __main__.py             # CLI: backfill | build-index [--force] | reindex [--confirm]
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
     │   ├── runner.py               # run_once(days=N); POST with unlimited retry
@@ -858,9 +864,46 @@ curl -s -X DELETE -H "API-Token: $API_TOKEN" http://localhost:1706/reviews/dupli
 # Backfill missing embeddings (manual, if startup backfill failed)
 docker exec bankiru-api python -m bankiru.embedder backfill
 
+# Build HNSW index only (embeddings OK, index missing/invalid; 15-45+ min)
+docker exec bankiru-api python -m bankiru.embedder build-index
+docker exec bankiru-api python -m bankiru.embedder build-index --force  # drop + rebuild
+
 # Reindex all embeddings (required after embedding format or model change; ~1 h for ~380K rows)
 docker exec bankiru-api python -m bankiru.embedder reindex          # dry-run
 docker exec bankiru-api python -m bankiru.embedder reindex --confirm
+
+# Verify embeddings + HNSW index are fully ready (-i required for heredoc stdin)
+docker exec -i bankiru-api python - <<'PY'
+import asyncio
+from sqlalchemy import text
+from bankiru.db import get_engine
+
+async def main():
+    sql = text("""
+        SELECT
+          (SELECT count(*) FROM bankiru.reviews)           AS reviews,
+          (SELECT count(*) FROM bankiru.review_embeddings) AS embeddings,
+          (SELECT count(*) FROM bankiru.reviews r
+             LEFT JOIN bankiru.review_embeddings e ON e.review_id = r.id
+             WHERE e.review_id IS NULL)                    AS missing,
+          i.indisvalid, i.indisready
+        FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = 'ix_review_embeddings_hnsw'
+    """)
+    async with get_engine().begin() as conn:
+        row = (await conn.execute(sql)).first()
+    if row is None:
+        print("HNSW index MISSING -> run: python -m bankiru.embedder build-index")
+        return
+    reviews, embeddings, missing, valid, ready = row
+    ok = missing == 0 and valid and ready
+    print(f"reviews={reviews} embeddings={embeddings} missing={missing} "
+          f"index_valid={valid} index_ready={ready}")
+    print("READY" if ok else "NOT READY")
+
+asyncio.run(main())
+PY
 
 # Postgres backup (external DB)
 pg_dump "$POSTGRES_URL" --no-owner --no-acl | gzip > backup-$(date +%F).sql.gz
@@ -935,7 +978,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 ### Парсер и источник данных
 
-Ежедневный cron (APScheduler, по умолчанию **00:05** `Europe/Moscow`) обходит **24 URL-слага** (**23** уникальных названия продуктов: 12 для физлиц и 12 для юрлиц; слаги `corporate` и `legal` ведут к одной услуге «Обслуживание юридических лиц»). За каждый запуск собираются отзывы за последние `PARSER_DAYS` календарных суток (по умолчанию **1** — «вчера») и одним пакетом отправляются в API.
+Ежедневный cron (APScheduler, по умолчанию **00:05** `Europe/Moscow`) обходит **24 URL-слага** (**23** уникальных названия продуктов: 12 для физлиц и 11 для юрлиц; слаги `corporate` и `legal` ведут к одной услуге «Обслуживание юридических лиц»). За каждый запуск собираются отзывы за последние `PARSER_DAYS` календарных суток (по умолчанию **1** — «вчера») и одним пакетом отправляются в API.
 
 Перед POST парсер опрашивает `GET /healthz`. При сбоях сети и **5xx** повторяет отправку бесконечно с экспоненциальной паузой (до 60 с); при **401/403/404/422** сразу завершается с ошибкой.
 
@@ -950,7 +993,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 | `reviews` | Отзывы: дата, текст, банк, URL, город, продукт |
 | `review_embeddings` | Векторы pgvector (1024 измерения, BAAI/bge-m3), индекс HNSW |
 
-Схема создаётся при старте API (`create_all_tables()`). Ежедневный бэкап пакета парсера — Parquet в OBS: `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`.
+Схема создаётся при старте API (`create_all_tables()`); построение отсутствующего HNSW-индекса **блокирует** готовность API. Ежедневный бэкап пакета парсера — Parquet в OBS: `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`.
 
 ### API (сервис `api`, порт по умолчанию 1706)
 
@@ -992,15 +1035,20 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 |------|-------|-----|
 | Inline | `POST /reviews` | Обогащённый passage-текст + `mode=passage` |
 | Backfill | Старт API (фон) | Строки без эмбеддинга; неудачный батч пропускается до следующего запуска |
+| Build-index | Индекс HNSW отсутствует/битый, эмбеддинги на месте | `build-index` (~15–45+ мин, без re-embed) |
 | Reindex | Вручную после смены формата/модели | `reindex --confirm` — TRUNCATE + полная пересборка (~1 ч на ~380K строк) |
 
 ```bash
 docker exec bankiru-api python -m bankiru.embedder backfill
+docker exec bankiru-api python -m bankiru.embedder build-index
+docker exec bankiru-api python -m bankiru.embedder build-index --force  # удалить и пересоздать
 docker exec bankiru-api python -m bankiru.embedder reindex          # dry-run
 docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 ```
 
 **После деплоя изменений качества эмбеддингов** выполните `reindex --confirm` один раз — иначе старые векторы останутся в прежнем формате.
+
+**Если reindex завершил embedding, но упал на создании индекса:** запустите `build-index`, а не `reindex --confirm` повторно.
 
 ### Суммаризация
 
@@ -1048,7 +1096,50 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 - Расписание парсера можно менять без перезапуска контейнера (SIGHUP + `/app/.env` внутри контейнера) — см. [Changing the daily crawl schedule](#changing-the-daily-crawl-schedule).
 - После изменений кода UI: `docker compose … build ui && up -d --force-recreate ui`.
 - После изменений формата/модели эмбеддингов: `docker exec bankiru-api python -m bankiru.embedder reindex --confirm`.
+- Если reindex завершил embedding, но упал на индексе: `build-index`, не повторный `reindex --confirm`.
 - Полный список команд — в разделе [Day-2 operations](#day-2-operations).
+
+---
+
+## Краткое описание (на русском)
+
+**bankiru-reviews** — Docker-стек для автоматического сбора и анализа негативных отзывов клиентов российских банков с портала [banki.ru](https://www.banki.ru).
+
+### Что делает система
+
+- **Собирает** отзывы с оценками 1–2 звезды по 23 банковским продуктам (12 для физлиц, 11 для юрлиц) — ежедневно, по расписанию.
+- **Хранит** отзывы в PostgreSQL с полнотекстовыми метаданными: дата, банк, продукт, город, URL источника.
+- **Выгружает** результаты в форматах CSV, JSON, Parquet и XLSX с загрузкой в S3-совместимое хранилище (Cloud.ru OBS) и выдачей pre-signed ссылки на скачивание.
+- **Суммаризирует** отзывы с помощью LLM (Cloud.ru Foundation Models, OpenAI-совместимый API) по схеме map-reduce — поддерживается любой объём данных.
+- **Ищет семантически** — встроенный векторный поиск на базе pgvector (BAAI/bge-m3, 1024 измерения, HNSW-индекс) позволяет находить отзывы по смыслу, а не только по ключевым словам.
+- **Защищает доступ** через Authentik (OIDC) — вход в веб-интерфейс только для авторизованных пользователей.
+
+### Архитектура
+
+Три сервиса в одном Docker Compose-стеке, собранные из единого образа:
+
+| Сервис | Роль |
+|--------|------|
+| **api** | REST API (FastAPI): приём, хранение, фильтрация, выгрузка и суммаризация отзывов |
+| **parser** | Ежедневный краулер banki.ru (APScheduler): сбор отзывов и отправка в API |
+| **ui** | Веб-интерфейс (Gradio + FastAPI): фильтры, семантический поиск, скачивание файлов и резюме |
+
+Внешние зависимости: PostgreSQL (с pgvector), S3/OBS, Authentik, Infisical.
+
+### Ключевые возможности
+
+- **Фильтрация** по дате, банку, продукту и городу (префиксный поиск).
+- **Семантический поиск** — текстовый запрос кодируется моделью BGE-M3 и сравнивается с векторами отзывов через HNSW-индекс pgvector.
+- **Четыре формата выгрузки** — CSV, JSON, Parquet, XLSX (с цветовой группировкой строк).
+- **LLM-суммаризация** — рекурсивный map-reduce, автоматический подбор размера чанков под контекстное окно модели.
+- **Автоматический бэкап** — каждый пакет парсера сохраняется как Parquet-файл в OBS.
+- **Безопасность** — секреты в tmpfs (Infisical), OIDC-аутентификация, HSTS, блокировка dotfile-запросов на Nginx.
+- **Наблюдаемость** — Logfire (OpenTelemetry): структурированные логи и трейсы для всех сервисов.
+- **Расширяемость** — новый формат выгрузки добавляется одним классом-наследником `*Maker`; регистрация автоматическая.
+
+### Технологии
+
+Python 3.13 · FastAPI · Gradio · SQLAlchemy · pgvector · pydantic-ai · tiktoken · APScheduler · httpx · aiobotocore · Authlib · Logfire · Docker · Nginx · Infisical
 
 ---
 
