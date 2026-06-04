@@ -1,6 +1,6 @@
 """Embedding utilities: generate vectors via Cloud.ru and backfill the DB.
 
-This module provides three main capabilities:
+This module provides four main capabilities:
 
   1. **embed_texts()** — Core function that calls the OpenAI-compatible
      /v1/embeddings endpoint to generate vector embeddings for a list of
@@ -20,6 +20,10 @@ This module provides three main capabilities:
   4. **format_review_for_embedding()** — Builds enriched passage text
      (``bankName | product | location`` + review body) for storage vectors.
 
+  HNSW index creation lives in ``bankiru.db.ensure_hnsw_index()`` (also exposed
+  as ``python -m bankiru.embedder build-index``). API startup and reindex
+  both call it; it validates ``indisvalid`` and avoids ``IF NOT EXISTS``.
+
 The embedding model (BAAI/bge-m3) produces 1024-dimensional vectors that
 are stored in the review_embeddings table (pgvector Vector(1024) column).
 BGE-M3 query/passage prefixes are applied in ``embed_texts()`` so search
@@ -30,8 +34,8 @@ Connection to other modules:
   - bankiru.api.routes     — calls embed_texts() for POST /reviews (new review
                              embedding) and GET /reviews (query embedding)
   - bankiru.api.app        — calls backfill_embeddings() as a background task
-  - bankiru.embedder.__main__ — CLI entry point for manual backfill/reindex
-  - bankiru.db             — provides _progress_bar() for visual feedback
+  - bankiru.embedder.__main__ — CLI entry point for backfill, build-index, reindex
+  - bankiru.db             — provides _progress_bar() and ensure_hnsw_index()
   - bankiru.models         — provides Review and ReviewEmbedding ORM models
   - bankiru.config         — provides embedding API credentials and settings
 """
@@ -174,6 +178,7 @@ async def embed_texts(
             )
 
     return all_embeddings
+
 
 async def _post_with_retry(
     client: httpx.AsyncClient,
@@ -392,7 +397,7 @@ async def reindex_embeddings(
       1. TRUNCATEs the review_embeddings table (fast, no per-row overhead)
       2. Drops the HNSW vector index (must be rebuilt after bulk insert)
       3. Runs backfill_embeddings() to re-embed all reviews
-      4. Rebuilds the HNSW index with increased maintenance_work_mem
+      4. Rebuilds the HNSW index via ``ensure_hnsw_index()``
 
     Without ``confirm=True`` this is a **dry-run** that only prints what
     *would* happen. This safety mechanism prevents accidental data loss.
@@ -444,7 +449,7 @@ async def reindex_embeddings(
     await backfill_embeddings(session_maker)
 
     # Step 4: Rebuild the HNSW index (shared helper; no re-embed).
-    await ensure_hnsw_index(force=True)
+    await ensure_hnsw_index()
 
     elapsed = _time.monotonic() - t0
     logfire.info("Reindex complete in {elapsed:.1f}s", elapsed=elapsed)

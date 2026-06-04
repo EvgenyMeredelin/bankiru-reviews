@@ -201,7 +201,8 @@ async def create_all_tables() -> None:
     """Bootstrap the database schema — called once during API startup (lifespan).
 
     This function is idempotent: it uses IF NOT EXISTS for the extension,
-    tables, and all indexes, so repeated calls on an already-initialised
+    tables, and B-tree indexes; the HNSW index is ensured separately via
+    ``ensure_hnsw_index()``. Repeated calls on an already-initialised
     database are safe and fast.
 
     Steps:
@@ -213,10 +214,8 @@ async def create_all_tables() -> None:
          This is necessary because create_all() skips tables that already
          exist, so indexes added to an existing model after initial
          deployment would be silently ignored without this step.
-      4. Create the HNSW vector index for approximate nearest-neighbor
-         search on the review_embeddings table. This is done via raw DDL
-         because SQLAlchemy's create_all() does not natively support
-         pgvector's HNSW index syntax.
+      4. Ensure the HNSW vector index via ``ensure_hnsw_index()`` (validates
+         ``indisvalid``, disables statement timeout, sets maintenance_work_mem).
     """
     # Step 1 + 2: pgvector extension and ORM tables
     async with get_engine().begin() as conn:
@@ -252,7 +251,7 @@ async def create_all_tables() -> None:
                 name=idx.name, elapsed=elapsed,
             )
     total_elapsed = _time.monotonic() - t0
-    logfire.info("all indexes ensured in {elapsed:.1f} s", elapsed=total_elapsed)
+    logfire.info("all B-tree indexes ensured in {elapsed:.1f} s", elapsed=total_elapsed)
 
     # ── Step 4: HNSW vector index (pgvector) ─────────────────────────────
     await ensure_hnsw_index()

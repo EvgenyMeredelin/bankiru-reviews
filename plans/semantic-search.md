@@ -33,7 +33,7 @@ flowchart TD
         reindex_fn[reindex - TRUNCATE + re-embed]
     end
 
-    reindex_cli[python -m bankiru.embedder\nbackfill / reindex CLI]
+    embedder_cli[python -m bankiru.embedder\nbackfill / build-index / reindex CLI]
 
     subgraph DB [PostgreSQL 17.5 + pgvector]
         reviews_table[bankiru.reviews]
@@ -57,8 +57,8 @@ flowchart TD
     backfill_fn -->|batch embed| embed_fn
     backfill_fn -->|store vectors| embeddings_table
 
-    reindex_cli --> reindex_fn
-    reindex_cli --> backfill_fn
+    embedder_cli --> reindex_fn
+    embedder_cli --> backfill_fn
     reindex_fn -->|TRUNCATE + re-embed all| embeddings_table
 ```
 
@@ -104,16 +104,20 @@ CREATE TABLE bankiru.review_embeddings (
 
 ### 4.3 HNSW index
 
+Implemented in ``bankiru.db.ensure_hnsw_index()`` (also: ``python -m bankiru.embedder build-index``):
+
 ```sql
-CREATE INDEX IF NOT EXISTS ix_review_embeddings_hnsw
+CREATE INDEX ix_review_embeddings_hnsw
     ON bankiru.review_embeddings
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 200);
 ```
 
-Parameters: `m=16` and `ef_construction=200` are good defaults for 380K vectors with 1024 dimensions. The index build will consume ~2–4 GB of `maintenance_work_mem`; set it temporarily during the backfill.
+``CREATE INDEX IF NOT EXISTS`` is **not** used — it silently skips invalid indexes left over from a cancelled build. The helper checks ``pg_index.indisvalid``, drops broken indexes, sets ``statement_timeout = 0`` and ``maintenance_work_mem = 2GB``, then creates the index.
 
-**Note:** SQLAlchemy's `create_all()` does not natively handle HNSW indexes. The HNSW index must be created via explicit `text()` DDL in `create_all_tables()`, similar to how the existing B-tree indexes are ensured with `CREATE INDEX IF NOT EXISTS`.
+Parameters: `m=16` and `ef_construction=200` are good defaults for 380K vectors with 1024 dimensions. Index build on ~380K rows takes **15–45+ minutes** and blocks API startup until complete.
+
+**Note:** SQLAlchemy's `create_all()` does not natively handle HNSW indexes. `create_all_tables()` delegates to `ensure_hnsw_index()` after B-tree indexes are ensured.
 
 ### 4.4 SQLAlchemy model
 
@@ -141,7 +145,7 @@ class ReviewEmbedding(Base):
 
 New package: **`src/bankiru/embedder/`**
 
-This package contains all embedding-related logic — the Cloud.ru API client, backfill, and reindex. Both the API service (routes, lifespan) and the CLI entry point import from here, avoiding circular dependencies.
+This package contains embedding logic — the Cloud.ru API client, enriched passage formatting, backfill, and reindex. HNSW index creation lives in ``bankiru.db.ensure_hnsw_index()`` (exposed as ``build-index`` CLI). Both the API service (routes, lifespan) and the CLI entry point import from here, avoiding circular dependencies.
 
 ### 5.1 Core function: `embed_texts()`
 
@@ -174,6 +178,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
 ```
 
 Key design points:
+- **BGE-M3 prefixes:** `mode="query"` for search strings, `mode="passage"` for stored review text (via `format_review_for_embedding()`)
 - **Fallback chain:** `EMBEDDINGS_API_KEY` → `OPENAI_API_KEY`; `EMBEDDINGS_BASE_URL` → `OPENAI_BASE_URL` (same Cloud.ru Foundation Models endpoint)
 - **Batch splitting:** `embed_texts()` accepts any number of texts; internally splits into sub-batches of `EMBEDDINGS_BATCH_SIZE` (50)
 - **Retry with exponential backoff** on 429/5xx
@@ -197,7 +202,7 @@ async def backfill_embeddings(session_maker, *, batch_size: int = 500) -> int:
 
 ```python
 async def reindex_embeddings(session_maker, *, confirm: bool = False) -> None:
-    """TRUNCATE review_embeddings, drop HNSW index, re-embed all, rebuild index.
+    """TRUNCATE review_embeddings, drop HNSW index, re-embed all, rebuild via ensure_hnsw_index().
 
     If confirm=False, prints a dry-run summary and returns without changes.
     """
@@ -218,6 +223,8 @@ EMBEDDINGS_DIMENSIONS: int = 1024
 EMBEDDINGS_BATCH_SIZE: int = 50               # texts per API call
 EMBEDDINGS_BACKFILL_BATCH: int = 500          # DB rows per backfill iteration
 SEMANTIC_SEARCH_LIMIT: int = 200              # max results when keywords are used
+SEMANTIC_SEARCH_EF_SEARCH: int = 100          # hnsw.ef_search at query time
+SEMANTIC_SEARCH_MAX_DISTANCE: float | None = 0.55  # cosine distance ceiling; None disables
 ```
 
 ### 6.2 New `.env.example` entries
@@ -236,6 +243,10 @@ EMBEDDINGS_BATCH_SIZE=50
 EMBEDDINGS_BACKFILL_BATCH=500
 # Max reviews returned when Semantic search field is used
 SEMANTIC_SEARCH_LIMIT=200
+# pgvector HNSW recall at query time (higher = better recall, slightly slower).
+SEMANTIC_SEARCH_EF_SEARCH=100
+# Cosine distance ceiling; omit or leave empty to disable the similarity floor.
+SEMANTIC_SEARCH_MAX_DISTANCE=0.55
 ```
 
 ---
@@ -411,9 +422,11 @@ the currently configured model.
 New module: **`src/bankiru/embedder/__main__.py`**
 
 ```
-python -m bankiru.embedder backfill          # embed only un-embedded rows (default startup behavior)
-python -m bankiru.embedder reindex           # dry-run: show what would happen
-python -m bankiru.embedder reindex --confirm # full reindex: TRUNCATE + re-embed all
+python -m bankiru.embedder backfill                    # embed only un-embedded rows
+python -m bankiru.embedder build-index                 # HNSW index only (no re-embed)
+python -m bankiru.embedder build-index --force           # drop + rebuild index
+python -m bankiru.embedder reindex                     # dry-run: show what would happen
+python -m bankiru.embedder reindex --confirm           # full reindex: TRUNCATE + re-embed all
 ```
 
 This follows the project's existing `__main__.py` pattern (see `bankiru.api`,
@@ -451,19 +464,20 @@ flowchart TD
 2. **Full reindex (`--confirm`):**
    - `TRUNCATE bankiru.review_embeddings` — fast, no per-row overhead, removes all stale embeddings
    - `DROP INDEX IF EXISTS ix_review_embeddings_hnsw` — building HNSW during inserts is slow; drop first, rebuild after
-   - Fetch reviews in batches of `EMBEDDINGS_BACKFILL_BATCH` (500 rows), ordered by `id`
+   - Run ``backfill_embeddings()`` (enriched passage text via ``format_review_for_embedding()``, ``mode=passage``)
    - For each batch:
-     - Call `embed_texts()` with sub-batches of `EMBEDDINGS_BATCH_SIZE` (50)
+     - Sub-batch API calls via ``embed_texts(..., mode="passage")``
      - Bulk INSERT embeddings into `review_embeddings`
      - Log progress: `[########............]  40%  [3200/8000 batches]  elapsed: 12m  ETA: 18m`
      - Commit after each batch (so progress survives interruption)
-   - After all rows: `CREATE INDEX ix_review_embeddings_hnsw ...` with `SET maintenance_work_mem = '2GB'`
+   - After all rows: call ``ensure_hnsw_index()`` (``SET statement_timeout = 0``, ``maintenance_work_mem = 2GB``, validates ``indisvalid``)
    - Log completion: `"Reindex complete. N embeddings created in Xm Ys."`
 
 3. **Interruption recovery:**
    - If the reindex is interrupted mid-way, the `review_embeddings` table contains a partial set
    - Running `python -m bankiru.embedder backfill` (or simply restarting the API, which triggers the startup backfill) will pick up where it left off — it only processes rows where `review_id NOT IN (SELECT review_id FROM review_embeddings)`
-   - The HNSW index will be rebuilt by `create_all_tables()` at the next API startup if it's missing
+   - If embedding finished but index creation failed: run `python -m bankiru.embedder build-index` (do **not** re-run full reindex)
+   - The HNSW index will also be rebuilt by `ensure_hnsw_index()` at the next API startup if it is missing or invalid
 
 ### 12.5 Safety considerations
 
@@ -489,16 +503,16 @@ flowchart TD
 
 | File | Action | Description |
 |------|--------|-------------|
-| `src/bankiru/config.py` | Modify | Add `EMBEDDINGS_*` and `SEMANTIC_SEARCH_LIMIT` settings |
+| `src/bankiru/config.py` | Modify | Add `EMBEDDINGS_*`, `SEMANTIC_SEARCH_LIMIT`, `SEMANTIC_SEARCH_EF_SEARCH`, `SEMANTIC_SEARCH_MAX_DISTANCE` |
 | `src/bankiru/models.py` | Modify | Add `ReviewEmbedding` model with `Vector(1024)` column |
-| `src/bankiru/db.py` | Modify | Enable pgvector extension + create HNSW index via explicit DDL in `create_all_tables()` |
-| `src/bankiru/embedder/__init__.py` | **New** | `embed_texts()`, `backfill_embeddings()`, `reindex_embeddings()` |
-| `src/bankiru/embedder/__main__.py` | **New** | CLI entry point: `backfill` and `reindex` commands |
+| `src/bankiru/db.py` | Modify | Enable pgvector extension; `ensure_hnsw_index()` (validates `indisvalid`, no `IF NOT EXISTS`) |
+| `src/bankiru/embedder/__init__.py` | **New** | `embed_texts()`, `format_review_for_embedding()`, `backfill_embeddings()`, `reindex_embeddings()` |
+| `src/bankiru/embedder/__main__.py` | **New** | CLI: `backfill`, `build-index [--force]`, `reindex [--confirm]` |
 | `src/bankiru/api/schemas.py` | Modify | Add `keywords: str \| None` to `Request` |
 | `src/bankiru/api/routes.py` | Modify | Add semantic search branch in `get_reviews()`; embed on `post_reviews()` |
-| `src/bankiru/api/app.py` | Modify | Launch backfill background task in lifespan |
+| `src/bankiru/api/app.py` | Modify | Lifespan: `create_all_tables()` (blocks on HNSW build) + backfill background task |
 | `src/bankiru/ui/blocks.py` | Modify | Add Semantic search textbox; wire to inputs and `get_reviews()` |
-| `.env.example` | Modify | Add `EMBEDDINGS_*` and `SEMANTIC_SEARCH_LIMIT` env vars |
+| `.env.example` | Modify | Add `EMBEDDINGS_*`, `SEMANTIC_SEARCH_*` env vars |
 | `pyproject.toml` | Modify | Add `pgvector` dependency |
 | `README.md` | Modify | Document semantic search, reindex CLI, new env vars, pgvector setup |
 
@@ -520,7 +534,7 @@ flowchart TD
    - Implement all changes
    - `docker compose build`
    - `docker compose up -d`
-   - The API will auto-create the `review_embeddings` table and start the backfill
+   - The API will auto-create the `review_embeddings` table, ensure the HNSW index (blocks startup when building), and start the backfill
 
 ---
 
@@ -529,12 +543,12 @@ flowchart TD
 1. Create `semantic-search` branch
 2. Enable pgvector extension on RDS (manual, via console)
 3. Add `pgvector` to `pyproject.toml` dependencies
-4. Add `EMBEDDINGS_*` and `SEMANTIC_SEARCH_LIMIT` settings to `config.py` and `.env.example`
+4. Add `EMBEDDINGS_*` and `SEMANTIC_SEARCH_*` settings to `config.py` and `.env.example`
 5. Add `ReviewEmbedding` model to `models.py`
-6. Update `db.py`: enable extension + create table + HNSW index via explicit DDL in `create_all_tables()`
-7. Create `embedder/__init__.py` with `embed_texts()`, `backfill_embeddings()`, `reindex_embeddings()`
-8. Create `embedder/__main__.py` with CLI: `backfill` and `reindex [--confirm]` commands
-9. Update `api/app.py`: launch backfill background task in lifespan (imports from embedder package)
+6. Update `db.py`: enable extension + `ensure_hnsw_index()` called from `create_all_tables()`
+7. Create `embedder/__init__.py` with `embed_texts()`, `format_review_for_embedding()`, `backfill_embeddings()`, `reindex_embeddings()`
+8. Create `embedder/__main__.py` with CLI: `backfill`, `build-index [--force]`, `reindex [--confirm]`
+9. Update `api/app.py`: lifespan calls `create_all_tables()` (HNSW build may block startup) and launches backfill background task
 10. Update `api/schemas.py`: add `keywords` field to `Request`
 11. Update `api/routes.py`: hybrid search in `get_reviews()`, embed in `post_reviews()`
 12. Update `ui/blocks.py`: add Semantic search textbox, wire to inputs and API call

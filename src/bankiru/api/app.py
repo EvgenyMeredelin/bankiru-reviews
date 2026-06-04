@@ -6,7 +6,10 @@ the API service. It is imported by uvicorn at startup (via the import string
 
 Responsibilities:
   - Define the application lifespan (startup/shutdown hooks):
-      1. Bootstrap the database schema (tables, indexes, pgvector extension)
+      1. Bootstrap the database schema (tables, B-tree indexes, pgvector
+         extension) and ensure the HNSW vector index via ``ensure_hnsw_index()``
+         — **blocks startup** until the index is ready (~15–45+ min when
+         building from scratch on ~380K rows)
       2. Spawn a background task to backfill embeddings for any reviews that
          don't yet have a vector (e.g. after initial deployment or if the
          embeddings API was temporarily unavailable during a POST /reviews)
@@ -16,7 +19,7 @@ Responsibilities:
 
 Connection to other modules:
   - bankiru.api.routes   — provides the router with all HTTP endpoints
-  - bankiru.db           — provides create_all_tables() and session factory
+  - bankiru.db           — provides create_all_tables(), ensure_hnsw_index(), session factory
   - bankiru.embedder     — provides backfill_embeddings() for the background task
   - bankiru.__init__     — provides __version__ for the OpenAPI spec
 """
@@ -73,7 +76,8 @@ async def lifespan(app: FastAPI):
 
     Startup:
       1. create_all_tables() — ensures the pgvector extension, ORM tables,
-         B-tree indexes, and HNSW vector index all exist (idempotent).
+         B-tree indexes, and HNSW vector index (via ``ensure_hnsw_index()``).
+         Building a missing HNSW index **blocks** readiness until complete.
       2. Spawn the embedding backfill as a non-blocking background task.
 
     Shutdown:
@@ -83,9 +87,10 @@ async def lifespan(app: FastAPI):
     protocol). Everything before ``yield`` runs at startup; everything
     after runs at shutdown.
     """
-    # Startup: bootstrap DB schema (tables + indexes)
+    # Startup: bootstrap DB schema (B-tree indexes + HNSW; latter may block).
     await create_all_tables()
-    # Spawn embedding backfill as a background task — does not block startup.
+    # Spawn embedding backfill as a background task — does not block startup
+    # (any HNSW build already completed in create_all_tables() above).
     # The task embeds any reviews that don't yet have embeddings.
     # On first deploy this processes all 380K existing reviews; on subsequent
     # restarts it's a no-op (all rows already embedded).

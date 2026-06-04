@@ -13,6 +13,7 @@ Usage::
 The embedder is separate from the API service because:
   - Backfill runs automatically at API startup (app.py lifespan), but may
     need to be triggered manually after failures or model changes.
+  - Build-index rebuilds the HNSW index without re-embedding (recovery path).
   - Reindex is a destructive operation that should only be run intentionally.
 
 Connection to other modules:
