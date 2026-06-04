@@ -27,10 +27,10 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from bankiru.config import get_settings
 from bankiru.ui.blocks import gradio_ui
 
-# Path to the project's assets directory (contains the logo image).
+# Path to the project's assets directory.
 # Resolves relative to this file: src/bankiru/ui/app.py → src/bankiru/ui → src/bankiru → src → assets
 ASSETS_DIR = Path(__file__).resolve().parents[3] / "assets"
-LOGO_PATH = ASSETS_DIR / "bankiru-reviews-logo.png"
+FAVICON_PATH = ASSETS_DIR / "bankiru-icon.png"
 
 
 def _require(value, name: str) -> str:
@@ -225,8 +225,8 @@ def create_app() -> FastAPI:
     # ── Favicon ──────────────────────────────────────────────────────
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():
-        """Serve the project logo as the browser favicon."""
-        return FileResponse(str(LOGO_PATH))
+        """Serve the project icon as the browser favicon."""
+        return FileResponse(str(FAVICON_PATH), media_type="image/png")
 
     # ── Gradio auth dependency ───────────────────────────────────────
     def get_user(request: Request) -> str | None:

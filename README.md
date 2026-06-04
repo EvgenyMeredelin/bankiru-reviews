@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/bankiru-reviews-logo.png" alt="bankiru-reviews logo" width="400">
+  <img src="assets/bankiru-logo-white.svg" alt="banki.ru logo" width="500">
 </p>
 
 <h1 align="center">bankiru-reviews</h1>
@@ -609,7 +609,9 @@ Eight defense-in-depth measures over a vanilla Authlib-on-Starlette template:
 ```text
 bankiru-reviews/
 ├── assets/
-│   └── bankiru-reviews-logo.png    # logo; also served at /favicon.ico
+│   ├── bankiru-icon.png            # favicon (served at /favicon.ico)
+│   ├── bankiru-logo.svg            # wordmark (black text)
+│   └── bankiru-logo-white.svg      # wordmark (white text; README header)
 ├── config/
 │   └── bankiru-reviews.conf        # Nginx vhost (TLS, ACME, Gradio SSE/WS proxy)
 ├── docker-compose.yml              # api + parser + ui; single shared env_file on tmpfs
