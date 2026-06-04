@@ -132,7 +132,7 @@ summary = gr.Markdown(
 #   Right column (scale=7):  summary display (Markdown with copy button)
 #
 # fill_height=True makes the Blocks expand to fill the browser viewport.
-with gr.Blocks(title="Banki.ru UI", fill_height=True) as gradio_ui:
+with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
     # Render the hidden download URL box (declared above) into the layout.
     # It must be inside the Blocks context to participate in event wiring.
     download_url_box.render()
