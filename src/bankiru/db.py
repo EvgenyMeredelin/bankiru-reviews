@@ -124,6 +124,79 @@ def _progress_bar(done: int, total: int, *, width: int = 20) -> str:
     return "[" + "#" * filled + "." * (width - filled) + "]" + f"  {frac:>4.0%}"
 
 
+_HNSW_INDEX_DDL = (
+    "CREATE INDEX ix_review_embeddings_hnsw "
+    "ON bankiru.review_embeddings "
+    "USING hnsw (embedding vector_cosine_ops) "
+    "WITH (m = 16, ef_construction = 200)"
+)
+
+# pg_indexes alone is not enough: a failed build can leave an invalid index
+# that IF NOT EXISTS treats as "already there" and skips rebuilding.
+_HNSW_INDEX_STATUS_SQL = text(
+    "SELECT ix.indisvalid "
+    "FROM pg_class c "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_index ix ON ix.indexrelid = c.oid "
+    "JOIN pg_class t ON t.oid = ix.indrelid "
+    "WHERE n.nspname = 'bankiru' "
+    "AND t.relname = 'review_embeddings' "
+    "AND c.relname = 'ix_review_embeddings_hnsw'"
+)
+
+
+async def ensure_hnsw_index(*, force: bool = False) -> None:
+    """Create the HNSW vector index on ``review_embeddings`` if it is missing.
+
+    Uses ``statement_timeout = 0`` and ``maintenance_work_mem = 2GB`` because
+    building HNSW on ~380K rows routinely exceeds the engine default (300 s)
+    and benefits from extra RAM during construction.
+
+    Drops and rebuilds when the index is missing, invalid, or ``force=True``.
+    ``CREATE INDEX IF NOT EXISTS`` is intentionally avoided — it silently skips
+    invalid indexes left over from a cancelled build.
+
+    Args:
+        force: When True, drop a valid index and rebuild from scratch.
+    """
+    async with get_engine().begin() as conn:
+        row = (await conn.execute(_HNSW_INDEX_STATUS_SQL)).first()
+
+        if row is not None:
+            is_valid = bool(row[0])
+            if is_valid and not force:
+                logfire.info("HNSW index already exists and is valid")
+                return
+            logfire.info(
+                "Dropping HNSW index (force={force}, valid={valid}) …",
+                force=force,
+                valid=is_valid,
+            )
+            await conn.execute(
+                text("DROP INDEX IF EXISTS bankiru.ix_review_embeddings_hnsw")
+            )
+
+        await conn.execute(text("SET LOCAL statement_timeout = 0"))
+        await conn.execute(text("SET LOCAL maintenance_work_mem = '2GB'"))
+        logfire.info(
+            "Building HNSW index on review_embeddings "
+            "(may take 15–45+ minutes for ~380K rows) …"
+        )
+        t0 = _time.monotonic()
+        await conn.execute(text(_HNSW_INDEX_DDL))
+        elapsed = _time.monotonic() - t0
+
+    async with get_engine().begin() as conn:
+        row = (await conn.execute(_HNSW_INDEX_STATUS_SQL)).first()
+        if row is None or not row[0]:
+            raise RuntimeError(
+                "HNSW index ix_review_embeddings_hnsw is missing or invalid "
+                "after CREATE INDEX"
+            )
+
+    logfire.info("HNSW index ready ({elapsed:.1f} s)", elapsed=elapsed)
+
+
 async def create_all_tables() -> None:
     """Bootstrap the database schema — called once during API startup (lifespan).
 
@@ -182,21 +255,4 @@ async def create_all_tables() -> None:
     logfire.info("all indexes ensured in {elapsed:.1f} s", elapsed=total_elapsed)
 
     # ── Step 4: HNSW vector index (pgvector) ─────────────────────────────
-    # SQLAlchemy's create_all() does not handle HNSW indexes natively.
-    # Issue explicit DDL with IF NOT EXISTS so it's idempotent.
-    # Parameters:
-    #   - vector_cosine_ops: use cosine distance for similarity (standard
-    #     for text embeddings like BAAI/bge-m3).
-    #   - m=16: number of bi-directional links per node in the HNSW graph
-    #     (higher = better recall but more memory).
-    #   - ef_construction=200: size of the dynamic candidate list during
-    #     index build (higher = better recall but slower build).
-    async with get_engine().begin() as conn:
-        await conn.execute(text("SET LOCAL statement_timeout = 0"))
-        await conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_review_embeddings_hnsw "
-            "ON bankiru.review_embeddings "
-            "USING hnsw (embedding vector_cosine_ops) "
-            "WITH (m = 16, ef_construction = 200)"
-        ))
-    logfire.info("HNSW vector index ensured")
+    await ensure_hnsw_index()

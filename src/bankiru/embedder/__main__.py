@@ -5,7 +5,8 @@ It is run ad-hoc (not as a long-lived service) via ``docker exec`` or locally:
 
 Usage::
 
-    python -m bankiru.embedder backfill           # embed un-embedded reviews
+    python -m bankiru.embedder backfill            # embed un-embedded reviews
+    python -m bankiru.embedder build-index         # create HNSW index only
     python -m bankiru.embedder reindex             # dry-run: show what would happen
     python -m bankiru.embedder reindex --confirm   # drop all + rebuild from scratch
 
@@ -16,7 +17,7 @@ The embedder is separate from the API service because:
 
 Connection to other modules:
   - bankiru.embedder.__init__ — provides backfill_embeddings() and reindex_embeddings()
-  - bankiru.db                — provides get_engine() and get_session_maker()
+  - bankiru.db                — provides get_engine(), get_session_maker(), ensure_hnsw_index()
   - bankiru.logging           — provides Logfire configuration
 """
 
@@ -25,7 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 
-from bankiru.db import get_engine, get_session_maker
+from bankiru.db import ensure_hnsw_index, get_engine, get_session_maker
 from bankiru.embedder import backfill_embeddings, reindex_embeddings
 from bankiru.logging import configure_logfire
 
@@ -41,6 +42,12 @@ async def _run_backfill() -> None:
     get_engine()
     session_maker = get_session_maker()
     await backfill_embeddings(session_maker)
+
+
+async def _run_build_index(*, force: bool) -> None:
+    """Create (or rebuild) the HNSW index without touching embedding rows."""
+    get_engine()
+    await ensure_hnsw_index(force=force)
 
 
 async def _run_reindex(confirm: bool) -> None:
@@ -64,19 +71,29 @@ def main() -> None:
     """
     configure_logfire(service_name="embedder")
 
-    # Build the CLI argument parser with two subcommands.
+    # Build the CLI argument parser with subcommands.
     parser = argparse.ArgumentParser(
         prog="python -m bankiru.embedder",
-        description="Manage review embeddings (backfill / reindex).",
+        description="Manage review embeddings (backfill / build-index / reindex).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # `backfill` — embed reviews that don't have a vector yet.
-    # This is the safe, incremental operation.
     sub.add_parser("backfill", help="Embed reviews that don't have a vector yet.")
 
+    # `build-index` — create HNSW index on existing embeddings (recovery path).
+    build_index_parser = sub.add_parser(
+        "build-index",
+        help="Create the HNSW index on review_embeddings (no re-embed).",
+    )
+    build_index_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Drop and rebuild the index even if it already exists.",
+    )
+
     # `reindex` — destructive: drop all embeddings and rebuild.
-    # Requires --confirm to actually execute (dry-run by default).
     reindex_parser = sub.add_parser(
         "reindex",
         help="Drop all embeddings and rebuild from scratch.",
@@ -93,6 +110,8 @@ def main() -> None:
     # Dispatch to the appropriate async function.
     if args.command == "backfill":
         asyncio.run(_run_backfill())
+    elif args.command == "build-index":
+        asyncio.run(_run_build_index(force=args.force))
     elif args.command == "reindex":
         asyncio.run(_run_reindex(args.confirm))
 

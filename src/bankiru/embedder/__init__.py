@@ -48,7 +48,7 @@ import logfire
 from sqlalchemy import func, insert, select, text
 
 from bankiru.config import get_settings
-from bankiru.db import _progress_bar
+from bankiru.db import _progress_bar, ensure_hnsw_index
 from bankiru.models import Review, ReviewEmbedding
 
 if TYPE_CHECKING:
@@ -443,25 +443,8 @@ async def reindex_embeddings(
     # Step 3: Re-embed all reviews using the standard backfill function.
     await backfill_embeddings(session_maker)
 
-    # Step 4: Rebuild the HNSW index with increased maintenance_work_mem
-    # for faster index construction. The 2GB setting allows Postgres to
-    # use more RAM during the build, significantly speeding up the process
-    # for large tables (380K+ rows). Disable statement_timeout — building
-    # HNSW on ~380K vectors routinely exceeds the engine default (300 s).
-    async with session_maker() as session:
-        await session.execute(text("SET LOCAL statement_timeout = 0"))
-        await session.execute(text("SET LOCAL maintenance_work_mem = '2GB'"))
-        logfire.info("Building HNSW index on review_embeddings …")
-        await session.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_review_embeddings_hnsw "
-                "ON bankiru.review_embeddings "
-                "USING hnsw (embedding vector_cosine_ops) "
-                "WITH (m = 16, ef_construction = 200)"
-            )
-        )
-        await session.commit()
-    logfire.info("HNSW index rebuilt")
+    # Step 4: Rebuild the HNSW index (shared helper; no re-embed).
+    await ensure_hnsw_index(force=True)
 
     elapsed = _time.monotonic() - t0
     logfire.info("Reindex complete in {elapsed:.1f}s", elapsed=elapsed)
