@@ -1,3 +1,4 @@
+<!-- bankiru-reviews README — explicit <a id> anchors for TOC; section headers use · [↑](#toc). -->
 <p align="center">
   <img src="assets/bankiru-logo-white.svg" alt="banki.ru logo" width="500">
 </p>
@@ -23,31 +24,76 @@
 
 ---
 
+<a id="toc"></a>
+
 ## Table of contents
 
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Stack overview](#stack-overview)
 - [Data model](#data-model)
+  - [Embeddings table: `bankiru.review_embeddings`](#embeddings-table-bankiru-review-embeddings)
 - [API reference](#api-reference)
+  - [`GET /healthz` — health probe](#get-healthz--health-probe)
+  - [`POST /reviews` — insert reviews](#post-reviews--insert-reviews)
+  - [`GET /reviews` — filter, export, and summarize](#get-reviews--filter-export-and-summarize)
+  - [`DELETE /reviews` — delete by ID](#delete-reviews--delete-by-id)
+  - [`DELETE /reviews/by-date` — delete by date range](#delete-reviewsby-date--delete-by-date-range)
+  - [`DELETE /reviews/duplicates` — deduplicate the table](#delete-reviewsduplicates--deduplicate-the-table)
+  - [`GET /` — redirect to docs](#get--redirect-to-docs)
 - [Output format handlers](#output-format-handlers)
 - [Parser — crawl mechanics](#parser--crawl-mechanics)
 - [Parser — request pacing and retry](#parser--request-pacing-and-retry)
+  - [How `PARSER_*` timing parameters interact](#how-parser_-timing-parameters-interact)
+  - [Putting it all together — a concrete example](#putting-it-all-together-a-concrete-example)
+  - [POST batch delivery](#post-batch-delivery)
+  - [Other implementation details](#other-implementation-details)
 - [Summarization — map-reduce pipeline](#summarization--map-reduce-pipeline)
 - [Semantic search](#semantic-search)
+  - [Embedding pipeline](#embedding-pipeline)
+  - [Embedder CLI](#embedder-cli)
+  - [Pre-deploy checklist](#pre-deploy-checklist)
 - [UI and authentication](#ui-and-authentication)
+  - [Registering the OIDC client in Authentik](#registering-the-oidc-client-in-authentik)
 - [Security hardening](#security-hardening)
 - [Repository layout](#repository-layout)
 - [Secrets — Infisical + tmpfs](#secrets--infisical--tmpfs)
 - [Configuration reference](#configuration-reference)
+  - [Required (no defaults)](#required-no-defaults)
+  - [Optional (shown with defaults)](#optional-shown-with-defaults)
 - [Quick start](#quick-start)
+  - [Production (with Infisical)](#production-with-infisical)
+  - [`start.sh` flags](#startsh-flags)
+  - [Local development (without Docker)](#local-development-without-docker)
 - [Day-2 operations](#day-2-operations)
+  - [Count reviews per day (with url dedup)](#count-reviews-per-day-with-url-dedup)
+  - [Export reviews to CSV on the host (no summarization)](#export-reviews-to-csv-on-the-host-no-summarization)
+  - [Changing the daily crawl schedule](#changing-the-daily-crawl-schedule)
+    - [Option A — SIGHUP (safe while a crawl is running)](#option-a--sighup-safe-while-a-crawl-is-running)
+    - [Option B — Container restart (kills any running crawl)](#option-b--container-restart-kills-any-running-crawl)
 - [Описание проекта (на русском)](#описание-проекта-на-русском)
+  - [Назначение](#назначение)
+  - [Парсер и источник данных](#парсер-и-источник-данных)
+  - [Хранение](#хранение)
+  - [API (сервис `api`, порт по умолчанию 1706)](#api-сервис-api-порт-по-умолчанию-1706)
+  - [Семантический поиск](#семантический-поиск)
+  - [Эмбеддинги](#эмбеддинги)
+  - [Суммаризация](#суммаризация)
+  - [Веб-интерфейс (сервис `ui`)](#веб-интерфейс-сервис-ui)
+  - [Безопасность UI](#безопасность-ui)
+  - [Инфраструктура и секреты](#инфраструктура-и-секреты)
+  - [Наблюдаемость и расширяемость](#наблюдаемость-и-расширяемость)
+  - [Эксплуатация](#эксплуатация)
 - [Краткое описание (на русском)](#краткое-описание-на-русском)
+  - [Что делает система](#что-делает-система)
+  - [Архитектура](#архитектура)
+  - [Ключевые возможности](#ключевые-возможности)
+  - [Технологии](#технологии)
 - [References](#references)
 
 ---
 
-## Architecture at a glance
+<a id="architecture-at-a-glance"></a>
+## Architecture at a glance · [↑](#toc)
 
 ```mermaid
 flowchart TD
@@ -79,7 +125,8 @@ flowchart TD
 
 ---
 
-## Stack overview
+<a id="stack-overview"></a>
+## Stack overview · [↑](#toc)
 
 | Service | Image | Purpose |
 |---------|-------|---------|
@@ -95,7 +142,8 @@ flowchart TD
 
 ---
 
-## Data model
+<a id="data-model"></a>
+## Data model · [↑](#toc)
 
 Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 
@@ -121,7 +169,8 @@ Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 
 **Deduplication keys:** `(reviewBody, product)` — compared via `md5(reviewBody)` to keep the hash table small (32-byte strings vs full review bodies). Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. MD5 collisions on natural-language texts are negligible. The crawler deduplicates in-memory before POSTing. The `DELETE /reviews/duplicates` endpoint deduplicates the database table in place (keeps the row with the lowest `id`).
 
-### Embeddings table: `bankiru.review_embeddings`
+<a id="embeddings-table-bankiru-review-embeddings"></a>
+### Embeddings table: `bankiru.review_embeddings` · [↑](#toc)
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -137,15 +186,18 @@ Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 
 ---
 
-## API reference
+<a id="api-reference"></a>
+## API reference · [↑](#toc)
 
 Base URL (in compose): `http://api:1706`. Externally: `http://localhost:1706` (port published on all interfaces by default).
 
-### `GET /healthz` — health probe
+<a id="get-healthz--health-probe"></a>
+### `GET /healthz` — health probe · [↑](#toc)
 
 No auth. Returns `{"status": "ok"}`. Used by Docker's `healthcheck`.
 
-### `POST /reviews` — insert reviews
+<a id="post-reviews--insert-reviews"></a>
+### `POST /reviews` — insert reviews · [↑](#toc)
 
 **Auth:** `API-Token` header (matches `API_TOKEN`).
 
@@ -168,7 +220,8 @@ Inserts all rows, commits, generates vector embeddings for the new reviews (inli
 
 An empty JSON array (`[]`) is accepted and also returns `201` without touching the database or S3. If embedding generation fails for a batch, the reviews are still saved; missing embeddings are backfilled on the next API restart (see [Semantic search](#semantic-search)).
 
-### `GET /reviews` — filter, export, and summarize
+<a id="get-reviews--filter-export-and-summarize"></a>
+### `GET /reviews` — filter, export, and summarize · [↑](#toc)
 
 **Auth:** None (read-only; the UI does not send the API token).
 
@@ -205,7 +258,8 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
 
 `url` is a **pre-signed S3 URL** (valid ~1 hour). `comment` contains the LLM summary in Markdown. If no reviews match, `url` and `filename` are `null` and `comment` holds a "no results" message.
 
-### `DELETE /reviews` — delete by ID
+<a id="delete-reviews--delete-by-id"></a>
+### `DELETE /reviews` — delete by ID · [↑](#toc)
 
 **Auth:** `API-Token` header.
 
@@ -213,7 +267,8 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
 
 Returns `204 No Content`.
 
-### `DELETE /reviews/by-date` — delete by date range
+<a id="delete-reviewsby-date--delete-by-date-range"></a>
+### `DELETE /reviews/by-date` — delete by date range · [↑](#toc)
 
 **Auth:** `API-Token` header.
 
@@ -235,7 +290,8 @@ curl -s -X DELETE -H "API-Token: $API_TOKEN" \
   "http://localhost:1706/reviews/by-date?startDate=2026-05-17&endDate=2026-05-18"
 ```
 
-### `DELETE /reviews/duplicates` — deduplicate the table
+<a id="delete-reviewsduplicates--deduplicate-the-table"></a>
+### `DELETE /reviews/duplicates` — deduplicate the table · [↑](#toc)
 
 **Auth:** `API-Token` header.
 
@@ -243,13 +299,15 @@ Keeps the row with the lowest `id` per `(reviewBody, product)` pair (grouped by 
 
 **Response** (JSON): `{"deleted": <count>}`.
 
-### `GET /` — redirect to docs
+<a id="get--redirect-to-docs"></a>
+### `GET /` — redirect to docs · [↑](#toc)
 
 Redirects to `/docs` (Swagger UI). The API service exposes auto-docs; the UI service does not.
 
 ---
 
-## Output format handlers
+<a id="output-format-handlers"></a>
+## Output format handlers · [↑](#toc)
 
 Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subclasses `ScalarsHandler` and ends with `Maker`:
 
@@ -268,7 +326,8 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 ---
 
-## Parser — crawl mechanics
+<a id="parser--crawl-mechanics"></a>
+## Parser — crawl mechanics · [↑](#toc)
 
 **Products covered:** 24 URL slugs mapping to 23 distinct product labels (12 retail + 11 business). Defined in `parser/settings.py` as a `{slug: label}` dict. Note: banki.ru uses both `corporate` and `legal` slugs for "Обслуживание юридических лиц" — both are crawled and the crawler's in-memory deduplication discards the duplicate bodies.
 
@@ -293,11 +352,13 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 ---
 
-## Parser — request pacing and retry
+<a id="parser--request-pacing-and-retry"></a>
+## Parser — request pacing and retry · [↑](#toc)
 
 The client (`parser/client.py`) is deliberately **fully sequential** — one request at a time — to avoid triggering banki.ru's WAF.
 
-### How `PARSER_*` timing parameters interact
+<a id="how-parser_-timing-parameters-interact"></a>
+### How `PARSER_*` timing parameters interact · [↑](#toc)
 
 Six `PARSER_*` environment variables control the timing of every HTTP request the parser makes to banki.ru. They fall into three groups — **pacing**, **timeouts**, and **ban recovery** — and together they determine the total time a single request occupies and the average crawl throughput.
 
@@ -360,7 +421,8 @@ delay = min(base × jitter, BAN_PAUSE_MAX)       # jitter ∈ [0.5, 1.5)
 
 The connect-error retry is **unlimited** — the crawl pauses and resumes once the ban lifts, guaranteeing no data loss from transient bans.
 
-### Putting it all together — a concrete example
+<a id="putting-it-all-together-a-concrete-example"></a>
+### Putting it all together — a concrete example · [↑](#toc)
 
 With default settings, a single successful request cycle takes:
 
@@ -384,7 +446,8 @@ total:         501 requests ×  ~15 s  ≈ 2.1 hours
 
 Actual run time is 0.5–1.5 hours because many products have only 1–2 listing pages and the sleep distribution is uniform (not always 15 s).
 
-### POST batch delivery
+<a id="post-batch-delivery"></a>
+### POST batch delivery · [↑](#toc)
 
 After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate bulk INSERT, inline embedding generation, and the daily Parquet backup the API uploads after every insert.
 
@@ -392,7 +455,8 @@ Before the first POST attempt, the runner polls `GET /healthz` (up to 30 × 5 s)
 
 The POST retries **indefinitely** with exponential back-off capped at 60 s for transient failures (network errors, 5xx). **Client errors do not retry:** `401`, `403`, `404`, and `422` fail fast so a bad token or malformed payload surfaces immediately instead of looping for hours.
 
-### Other implementation details
+<a id="other-implementation-details"></a>
+### Other implementation details · [↑](#toc)
 
 - `http2=False` — banki.ru's WAF silently drops TLS handshakes that advertise the `h2` ALPN.
 - `max_connections=1, max_keepalive_connections=0` — enforces one connection at a time and no keepalive, matching the original parser's behaviour.
@@ -405,7 +469,8 @@ The POST retries **indefinitely** with exponential back-off capped at 60 s for t
 
 ---
 
-## Summarization — map-reduce pipeline
+<a id="summarization--map-reduce-pipeline"></a>
+## Summarization — map-reduce pipeline · [↑](#toc)
 
 The summarizer (`api/summarizer.py`) handles arbitrarily large filter results: it chunks the corpus to fit the model's context window and recursively reduces partial summaries until the result is a single coherent text. Users never see a "context size exceeded" error.
 
@@ -444,7 +509,8 @@ The `// 4` cap prevents a small-context model (e.g. 4 k tokens) with a large `OU
 
 ---
 
-## Semantic search
+<a id="semantic-search"></a>
+## Semantic search · [↑](#toc)
 
 The **Semantic search** field in the UI enables semantic (vector) search over review texts. When a query is provided, the system:
 
@@ -465,14 +531,16 @@ When Semantic search is empty, the query path is unchanged — all matching revi
 | `SEMANTIC_SEARCH_EF_SEARCH` | `100` | Sets `hnsw.ef_search` for the query transaction (pgvector default is 40). Higher values improve recall at the cost of slightly slower search. |
 | `SEMANTIC_SEARCH_MAX_DISTANCE` | `0.55` | Cosine distance ceiling — results above this threshold are excluded. Set empty, `none`, or omit to disable the floor. Must be ≥ 0 when set. |
 
-### Embedding pipeline
+<a id="embedding-pipeline"></a>
+### Embedding pipeline · [↑](#toc)
 
 - **New reviews:** Embedded inline during `POST /reviews` using enriched passage text. If embedding fails, the review is saved without an embedding and will be backfilled later.
 - **Startup backfill:** At API startup, a background task embeds any reviews that don't yet have embeddings. A batch that fails repeatedly is skipped for the rest of that run (avoiding an infinite loop); those rows are retried on the next restart or via the CLI.
 - **Reindex CLI:** `python -m bankiru.embedder reindex --confirm` regenerates all embeddings from scratch (required after changing embedding format or model). The embedder is a **CLI module**, not a long-lived Compose service — run it with `docker exec bankiru-api`.
 - **Build-index CLI:** `python -m bankiru.embedder build-index` creates the HNSW index on existing embeddings only (no re-embed). Use when vectors are present but the index is missing or invalid (~15–45+ min for ~380K rows). API startup also calls this via `ensure_hnsw_index()` and **blocks until the index is ready**.
 
-### Embedder CLI
+<a id="embedder-cli"></a>
+### Embedder CLI · [↑](#toc)
 
 ```bash
 # Backfill only — embed reviews missing embeddings
@@ -493,7 +561,8 @@ docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 
 **If reindex finished embedding but failed on index creation:** run `build-index` — do **not** re-run `reindex --confirm`.
 
-### Pre-deploy checklist
+<a id="pre-deploy-checklist"></a>
+### Pre-deploy checklist · [↑](#toc)
 
 1. **Enable pgvector on Cloud.ru RDS:**
    - Go to RDS console → instance → Plugins
@@ -526,7 +595,8 @@ docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 
 ---
 
-## UI and authentication
+<a id="ui-and-authentication"></a>
+## UI and authentication · [↑](#toc)
 
 The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application inside a FastAPI app. The FastAPI layer handles OIDC; the Gradio layer handles the review query form.
 
@@ -565,7 +635,8 @@ The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application ins
 
 **Session details:** Starlette `SessionMiddleware`, signed cookie `bankiru_session`, `same_site=lax`, `https_only=True`, 1-hour TTL. Session payload: `{sub, username, email, id_token}`.
 
-### Registering the OIDC client in Authentik
+<a id="registering-the-oidc-client-in-authentik"></a>
+### Registering the OIDC client in Authentik · [↑](#toc)
 
 Create one **OAuth2/OpenID** provider + application:
 
@@ -582,7 +653,8 @@ Copy the Client ID and Client Secret into Infisical as `OIDC_CLIENT_ID` / `OIDC_
 
 ---
 
-## Security hardening
+<a id="security-hardening"></a>
+## Security hardening · [↑](#toc)
 
 Eight defense-in-depth measures over a vanilla Authlib-on-Starlette template:
 
@@ -604,7 +676,8 @@ Eight defense-in-depth measures over a vanilla Authlib-on-Starlette template:
 
 ---
 
-## Repository layout
+<a id="repository-layout"></a>
+## Repository layout · [↑](#toc)
 
 ```text
 bankiru-reviews/
@@ -657,7 +730,8 @@ bankiru-reviews/
 
 ---
 
-## Secrets — Infisical + tmpfs
+<a id="secrets--infisical--tmpfs"></a>
+## Secrets — Infisical + tmpfs · [↑](#toc)
 
 Secrets live in a self-hosted Infisical instance and are pulled into a tmpfs file at start-up — **they never touch the SSD** and are wiped on host reboot.
 
@@ -676,11 +750,13 @@ Secrets live in a self-hosted Infisical instance and are pulled into a tmpfs fil
 
 ---
 
-## Configuration reference
+<a id="configuration-reference"></a>
+## Configuration reference · [↑](#toc)
 
 All configuration is environment-driven via Pydantic Settings (`src/bankiru/config.py`). The same env file is shared by all three containers.
 
-### Required (no defaults)
+<a id="required-no-defaults"></a>
+### Required (no defaults) · [↑](#toc)
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
@@ -695,7 +771,8 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | `OIDC_CLIENT_ID` | ui | Authentik OAuth2 client ID. |
 | `OIDC_CLIENT_SECRET` | ui | Authentik OAuth2 client secret. |
 
-### Optional (shown with defaults)
+<a id="optional-shown-with-defaults"></a>
+### Optional (shown with defaults) · [↑](#toc)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -743,9 +820,11 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 
 ---
 
-## Quick start
+<a id="quick-start"></a>
+## Quick start · [↑](#toc)
 
-### Production (with Infisical)
+<a id="production-with-infisical"></a>
+### Production (with Infisical) · [↑](#toc)
 
 ```bash
 # 1. Install the Infisical CLI (once per host)
@@ -774,7 +853,8 @@ curl http://localhost:1706/healthz   # {"status": "ok"}
 open https://bankiru.uva-advanced.ru
 ```
 
-### `start.sh` flags
+<a id="startsh-flags"></a>
+### `start.sh` flags · [↑](#toc)
 
 ```bash
 ./scripts/start.sh               # fetch secrets + docker compose up -d
@@ -788,7 +868,8 @@ Pass the client secret non-interactively:
 INFISICAL_CLIENT_SECRET=… ./scripts/start.sh
 ```
 
-### Local development (without Docker)
+<a id="local-development-without-docker"></a>
+### Local development (without Docker) · [↑](#toc)
 
 ```bash
 cp .env.example .env
@@ -826,7 +907,8 @@ asyncio.run(run_once(start_date='2026-05-17', end_date='2026-05-19'))
 
 ---
 
-## Day-2 operations
+<a id="day-2-operations"></a>
+## Day-2 operations · [↑](#toc)
 
 ```bash
 # Stream logs
@@ -914,11 +996,194 @@ pg_dump "$POSTGRES_URL" --no-owner --no-acl | gzip > backup-$(date +%F).sql.gz
 # as bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet in the OBS bucket.
 ```
 
-### Changing the daily crawl schedule
+<a id="count-reviews-per-day-with-url-dedup"></a>
+### Count reviews per day (with url dedup) · [↑](#toc)
+
+Query `bankiru.reviews` inside `bankiru-api` — no API call, no summarization, no S3.
+
+- `START` / `END` are calendar dates, **both inclusive** (same as [`GET /reviews`](#get-reviews--filter-export-and-summarize) and [`DELETE /reviews/by-date`](#delete-reviewsby-date--delete-by-date-range)).
+- **Total** — row count that day.
+- **Unique** — `COUNT(DISTINCT url)` that day.
+- **Dup** — `Total − Unique` that day (extra rows sharing a `url` on that day).
+- **TOTAL** — sums the daily columns. TOTAL **Unique** is the sum of daily `COUNT(DISTINCT url)` values (the same `url` on two days is counted twice). It is not range-level `COUNT(DISTINCT url)` across the whole period.
+- Every calendar day in `[START, END]` is printed; days with no reviews show `0`. The example below had reviews on all three days.
+
+Change `START` / `END` in the Python block for other ranges.
+
+```bash
+docker exec -i bankiru-api python - <<'PY'
+import asyncio
+from datetime import date, datetime, time, timedelta
+from sqlalchemy import func, select
+from bankiru.db import get_engine
+from bankiru.models import Review
+
+START = date(2026, 6, 11)   # inclusive
+END   = date(2026, 6, 13)   # inclusive
+
+async def main():
+    start = datetime.combine(START, time.min)
+    end = datetime.combine(END, time.max)
+    day_col = func.date_trunc("day", Review.datePublished).label("day")
+    sql = (
+        select(
+            day_col,
+            func.count().label("total"),
+            func.count(Review.url.distinct()).label("unique_urls"),
+        )
+        .where(Review.datePublished >= start, Review.datePublished <= end)
+        .group_by(day_col)
+        .order_by(day_col)
+    )
+    async with get_engine().begin() as conn:
+        rows = (await conn.execute(sql)).all()
+
+    by_day = {r[0].date(): (r[1], r[2]) for r in rows}
+
+    # Build rows for every day in range (including zeros).
+    table_rows = []
+    sum_total = 0
+    sum_unique = 0
+    d = START
+    while d <= END:
+        total, unique = by_day.get(d, (0, 0))
+        dup = total - unique
+        table_rows.append((d.isoformat(), total, unique, dup))
+        sum_total += total
+        sum_unique += unique
+        d += timedelta(days=1)
+
+    sum_dup = sum_total - sum_unique
+
+    w_day = max(len("Day"), max(len(r[0]) for r in table_rows))
+    w_total = max(len("Total"), len(str(sum_total)))
+    w_unique = max(len("Unique"), len(str(sum_unique)))
+    w_dup = max(len("Dup"), len(str(sum_dup)))
+
+    def sep(left, mid, right, fill="-"):
+        return (
+            left + fill * (w_day + 2)
+            + mid + fill * (w_total + 2)
+            + mid + fill * (w_unique + 2)
+            + mid + fill * (w_dup + 2) + right
+        )
+
+    def row(day, total, unique, dup):
+        return (
+            f"| {day:<{w_day}} "
+            f"| {total:>{w_total}} "
+            f"| {unique:>{w_unique}} "
+            f"| {dup:>{w_dup}} |"
+        )
+
+    print(sep("+", "+", "+"))
+    print(row("Day", "Total", "Unique", "Dup"))
+    print(sep("+", "+", "+"))
+    for day, total, unique, dup in table_rows:
+        print(row(day, total, unique, dup))
+    print(sep("+", "+", "+"))
+    print(row("TOTAL", sum_total, sum_unique, sum_dup))
+    print(sep("+", "+", "+"))
+
+asyncio.run(main())
+PY
+```
+
+Example output (illustrative; your counts will differ):
+
+```text
++------------+-------+--------+-----+
+| Day        | Total | Unique | Dup |
++------------+-------+--------+-----+
+| 2026-06-11 |   574 |    277 | 297 |
+| 2026-06-12 |   440 |    183 | 257 |
+| 2026-06-13 |   413 |    182 | 231 |
++------------+-------+--------+-----+
+| TOTAL      |  1427 |    642 | 785 |
++------------+-------+--------+-----+
+```
+
+<a id="export-reviews-to-csv-on-the-host-no-summarization"></a>
+### Export reviews to CSV on the host (no summarization) · [↑](#toc)
+
+Unlike [`GET /reviews`](#get-reviews--filter-export-and-summarize), this does **not** run LLM summarization or upload to OBS.
+
+- `bankiru-api` has **no bind mount** to the VM ([`docker-compose.yml`](docker-compose.yml) does not mount host paths), so the workflow is: write CSV in container `/tmp`, then `docker cp` to the host.
+- Uses `get_session_maker()` (not `get_engine().begin()`) so query results are full `Review` ORM rows.
+- Host output directory: `~/bankiru-reviews/export/`.
+- **Important:** `docker cp`, `rm`, and `wc -l` paths must match `START` / `END` in the script (`reviews-{START}_to_{END}.csv`).
+- Very wide date ranges can be slow or hit the DB `statement_timeout` (300 s); narrow the range or use direct `psql` COPY for huge dumps.
+
+```bash
+mkdir -p ~/bankiru-reviews/export
+
+docker exec -i bankiru-api python - <<'PY'
+import asyncio
+from datetime import date, datetime, time
+from pathlib import Path
+from sqlalchemy import select
+from bankiru.db import get_session_maker
+from bankiru.models import Review
+
+START, END = date(2026, 6, 11), date(2026, 6, 13)   # both inclusive
+OUT = Path(f"/tmp/reviews-{START}_to_{END}.csv")
+
+async def main():
+    start = datetime.combine(START, time.min)
+    end = datetime.combine(END, time.max)
+    sql = (
+        select(Review)
+        .where(Review.datePublished >= start, Review.datePublished <= end)
+        .order_by(Review.datePublished, Review.url, Review.product)
+    )
+    async with get_session_maker()() as session:
+        rows = (await session.execute(sql)).scalars().all()
+
+    import pandas as pd
+    df = pd.DataFrame([{
+        "datePublished": r.datePublished,
+        "reviewBody": r.reviewBody,
+        "bankName": r.bankName,
+        "url": r.url,
+        "location": r.location,
+        "product": r.product,
+    } for r in rows])
+    df.to_csv(OUT, index=False)
+    print(OUT, len(df))
+
+asyncio.run(main())
+PY
+
+docker cp bankiru-api:/tmp/reviews-2026-06-11_to_2026-06-13.csv \
+  ~/bankiru-reviews/export/
+
+# Optional: verify row count (+1 for header) — after successful docker cp above
+wc -l ~/bankiru-reviews/export/reviews-2026-06-11_to_2026-06-13.csv
+```
+
+**Clean up `bankiru-api` `/tmp` after a successful `docker cp`**
+
+Exports sit in the container filesystem, not on the VM. Remove the file so repeated exports do not accumulate. `/tmp` is also cleared on container recreate, but explicit cleanup is good on a long-lived container. Do not run `rm -rf /tmp/*` — use the specific file or the `reviews-*.csv` pattern only.
+
+Remove one file (match the export filename):
+
+```bash
+docker exec bankiru-api rm -f /tmp/reviews-2026-06-11_to_2026-06-13.csv
+```
+
+Remove all export CSVs from `/tmp`:
+
+```bash
+docker exec bankiru-api sh -c 'rm -f /tmp/reviews-*.csv'
+```
+
+<a id="changing-the-daily-crawl-schedule"></a>
+### Changing the daily crawl schedule · [↑](#toc)
 
 The parser reads `PARSER_CRON_HOUR` and `PARSER_CRON_MINUTE` at startup and also reloads them on **SIGHUP** ([`__main__.py`](src/bankiru/parser/__main__.py)).
 
-#### Option A — SIGHUP (safe while a crawl is running)
+<a id="option-a--sighup-safe-while-a-crawl-is-running"></a>
+#### Option A — SIGHUP (safe while a crawl is running) · [↑](#toc)
 
 Write the new cron values into `/app/.env` **inside the container**, then send SIGHUP to PID 1. The handler reads the file, patches `os.environ`, rebuilds `Settings`, and calls `reschedule_job()`. The running crawl (if any) is **not** interrupted — only the *next* trigger time changes.
 
@@ -950,7 +1215,8 @@ docker logs --tail 5 bankiru-parser
 > cached `Settings`, and calls `reschedule_job()`.  The process stays alive;
 > only the next trigger time changes.
 
-#### Option B — Container restart (kills any running crawl)
+<a id="option-b--container-restart-kills-any-running-crawl"></a>
+#### Option B — Container restart (kills any running crawl) · [↑](#toc)
 
 Update the values in Infisical (or edit `/dev/shm/bankiru-reviews-secrets/.env` on the host), then restart:
 
@@ -970,15 +1236,18 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 ---
 
-## Описание проекта (на русском)
+<a id="описание-проекта-на-русском"></a>
+## Описание проекта (на русском) · [↑](#toc)
 
 Краткое описание системы на русском языке. Подробности — в англоязычных разделах выше.
 
-### Назначение
+<a id="назначение"></a>
+### Назначение · [↑](#toc)
 
 Централизованный сбор, хранение и анализ негативных отзывов и претензий к российским банкам с портала [banki.ru](https://www.banki.ru) (оценки 1–2 звезды): фильтрация, семантический поиск, выгрузка в объектное хранилище и LLM-суммаризация через веб-интерфейс с входом через Authentik (OIDC).
 
-### Парсер и источник данных
+<a id="парсер-и-источник-данных"></a>
+### Парсер и источник данных · [↑](#toc)
 
 Ежедневный cron (APScheduler, по умолчанию **00:05** `Europe/Moscow`) обходит **24 URL-слага** (**23** уникальных названия продуктов: 12 для физлиц и 11 для юрлиц; слаги `corporate` и `legal` ведут к одной услуге «Обслуживание юридических лиц»). За каждый запуск собираются отзывы за последние `PARSER_DAYS` календарных суток (по умолчанию **1** — «вчера») и одним пакетом отправляются в API.
 
@@ -986,7 +1255,8 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 **Стратегия обхода banki.ru:** один HTTP-запрос за раз; перед каждым — случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Раздельные таймауты на соединение и чтение. Ошибки TCP-соединения (вероятный бан WAF) повторяются без лимита с нарастающей задержкой. HTTP/2 отключён — WAF banki.ru отбрасывает ALPN `h2`. Дедупликация в памяти и в БД — по паре `(reviewBody, product)` (в SQL через `md5(reviewBody)`).
 
-### Хранение
+<a id="хранение"></a>
+### Хранение · [↑](#toc)
 
 Внешний PostgreSQL, схема `bankiru`:
 
@@ -997,7 +1267,8 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 Схема создаётся при старте API (`create_all_tables()`); построение отсутствующего HNSW-индекса **блокирует** готовность API. Ежедневный бэкап пакета парсера — Parquet в OBS: `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`.
 
-### API (сервис `api`, порт по умолчанию 1706)
+<a id="api-сервис-api-порт-по-умолчанию-1706"></a>
+### API (сервис `api`, порт по умолчанию 1706) · [↑](#toc)
 
 | Эндпоинт | Аутентификация | Назначение |
 |----------|----------------|------------|
@@ -1011,7 +1282,8 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 **Фильтры `GET /reviews`:** диапазон дат; банк и продукт — точное совпадение; город — префикс (`startswith`).
 
-### Семантический поиск
+<a id="семантический-поиск"></a>
+### Семантический поиск · [↑](#toc)
 
 В UI поле называется **Semantic search**; параметр API — `keywords`.
 
@@ -1031,7 +1303,8 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 Отзывы **без** строки в `review_embeddings` в semantic-поиск **не попадают** (но видны при пустом Semantic search). Без Semantic search **лимита строк нет** — широкий фильтр на большой таблице может дать тяжёлую выгрузку и долгую суммаризацию. При ошибке эмбеддинга запроса API возвращает сообщение в поле `comment`, а не HTTP 500.
 
-### Эмбеддинги
+<a id="эмбеддинги"></a>
+### Эмбеддинги · [↑](#toc)
 
 | Этап | Когда | Как |
 |------|-------|-----|
@@ -1052,11 +1325,13 @@ docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 
 **Если reindex завершил embedding, но упал на создании индекса:** запустите `build-index`, а не `reindex --confirm` повторно.
 
-### Суммаризация
+<a id="суммаризация"></a>
+### Суммаризация · [↑](#toc)
 
 Map-reduce через Cloud.ru Foundation Models (OpenAI-совместимый API). Модель задаётся параметром `cloudModel` или `DEFAULT_CLOUD_MODEL`; в UI — выпадающий список **Summary model**. В ответе API заголовок резюме: `**Summary model:** \`…\``. Ошибки провайдера возвращаются текстом в поле `comment`, а не HTTP 500.
 
-### Веб-интерфейс (сервис `ui`)
+<a id="веб-интерфейс-сервис-ui"></a>
+### Веб-интерфейс (сервис `ui`) · [↑](#toc)
 
 Gradio + FastAPI + Authentik OIDC. На хосте слушает только `127.0.0.1:17060`; снаружи — через Nginx (TLS).
 
@@ -1077,23 +1352,27 @@ Gradio + FastAPI + Authentik OIDC. На хосте слушает только `
 
 Кнопки, выпадающие списки, поля ввода и аккордеон Summary — **прямоугольные** (тема Ocean, радиус 0; дополнительный CSS на случай, если токены темы не покрывают внутренний chrome Gradio).
 
-### Безопасность UI
+<a id="безопасность-ui"></a>
+### Безопасность UI · [↑](#toc)
 
 Authentik (OIDC): фиксированный `OIDC_REDIRECT_URI`, RP-initiated logout с `id_token_hint`, сессия `{sub, username, email, id_token}`. На Nginx — HSTS, `X-Content-Type-Options`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`, блокировка dotfile-запросов. Swagger на сервисе `ui` отключён.
 
 **Важно:** `GET /reviews` на сервисе `api` **не требует токена** — учитывайте при публикации порта API.
 
-### Инфраструктура и секреты
+<a id="инфраструктура-и-секреты"></a>
+### Инфраструктура и секреты · [↑](#toc)
 
 Docker Compose: один образ, три сервиса (`api`, `parser`, `ui`). Postgres, S3/OBS, Authentik и Infisical **не** входят в compose. В продакшене стек запускается только через `./scripts/start.sh` — секреты из Infisical в tmpfs (`/dev/shm/bankiru-reviews-secrets/.env`), на диск не пишутся и стираются при перезагрузке хоста.
 
-### Наблюдаемость и расширяемость
+<a id="наблюдаемость-и-расширяемость"></a>
+### Наблюдаемость и расширяемость · [↑](#toc)
 
 **Logfire:** имена сервисов `api`, `parser`, `ui`, `embedder`; auto-tracing — модули API и UI; парсер и embedder CLI — явные spans.
 
 **Новый формат выгрузки:** подкласс `*Maker` в `handlers.py`; регистрация автоматическая через `inspect.getmembers` в `schemas.py`.
 
-### Эксплуатация
+<a id="эксплуатация"></a>
+### Эксплуатация · [↑](#toc)
 
 - Расписание парсера можно менять без перезапуска контейнера (SIGHUP + `/app/.env` внутри контейнера) — см. [Changing the daily crawl schedule](#changing-the-daily-crawl-schedule).
 - После изменений кода UI: `docker compose … build ui && up -d --force-recreate ui`.
@@ -1103,11 +1382,13 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 
 ---
 
-## Краткое описание (на русском)
+<a id="краткое-описание-на-русском"></a>
+## Краткое описание (на русском) · [↑](#toc)
 
 **bankiru-reviews** — Docker-стек для автоматического сбора и анализа негативных отзывов клиентов российских банков с портала [banki.ru](https://www.banki.ru).
 
-### Что делает система
+<a id="что-делает-система"></a>
+### Что делает система · [↑](#toc)
 
 - **Собирает** отзывы с оценками 1–2 звезды по 23 банковским продуктам (12 для физлиц, 11 для юрлиц) — ежедневно, по расписанию.
 - **Хранит** отзывы в PostgreSQL с полнотекстовыми метаданными: дата, банк, продукт, город, URL источника.
@@ -1116,7 +1397,8 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 - **Ищет семантически** — встроенный векторный поиск на базе pgvector (BAAI/bge-m3, 1024 измерения, HNSW-индекс) позволяет находить отзывы по смыслу, а не только по ключевым словам.
 - **Защищает доступ** через Authentik (OIDC) — вход в веб-интерфейс только для авторизованных пользователей.
 
-### Архитектура
+<a id="архитектура"></a>
+### Архитектура · [↑](#toc)
 
 Три сервиса в одном Docker Compose-стеке, собранные из единого образа:
 
@@ -1128,7 +1410,8 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 
 Внешние зависимости: PostgreSQL (с pgvector), S3/OBS, Authentik, Infisical.
 
-### Ключевые возможности
+<a id="ключевые-возможности"></a>
+### Ключевые возможности · [↑](#toc)
 
 - **Фильтрация** по дате, банку, продукту и городу (префиксный поиск).
 - **Семантический поиск** — текстовый запрос кодируется моделью BGE-M3 и сравнивается с векторами отзывов через HNSW-индекс pgvector.
@@ -1139,13 +1422,15 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 - **Наблюдаемость** — Logfire (OpenTelemetry): структурированные логи и трейсы для всех сервисов.
 - **Расширяемость** — новый формат выгрузки добавляется одним классом-наследником `*Maker`; регистрация автоматическая.
 
-### Технологии
+<a id="технологии"></a>
+### Технологии · [↑](#toc)
 
 Python 3.13 · FastAPI · Gradio · SQLAlchemy · pgvector · pydantic-ai · tiktoken · APScheduler · httpx · aiobotocore · Authlib · Logfire · Docker · Nginx · Infisical
 
 ---
 
-## References
+<a id="references"></a>
+## References · [↑](#toc)
 
 - [banki.ru](https://www.banki.ru/)
 - [Cloud.ru Foundation Models](https://console.cloud.ru/spa/ml-foundation-models)
