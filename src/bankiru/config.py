@@ -92,12 +92,23 @@ class Settings(BaseSettings):
     )
 
     # ── Auth ─────────────────────────────────────────────────────────────
-    # API_TOKEN: shared secret used by the parser to authenticate POST /reviews
-    # requests to the API. Checked via an API-Token header in the API routes.
+    # API_TOKEN: privileged secret for write endpoints (POST/DELETE /reviews)
+    # and for GET /reviews when the request arrives via the public Nginx
+    # gateway. Checked via the API-Token header.
     API_TOKEN: str
+    # GUEST_API_TOKEN: comma-separated read-only tokens for external clients
+    # calling GET /reviews through https://bankiru.uva-advanced.ru (Nginx
+    # sets X-Bankiru-Gateway). Guests cannot POST/DELETE. Empty → only
+    # API_TOKEN is accepted on the gateway GET path.
+    GUEST_API_TOKEN: CommaList = []
     # LOGFIRE_TOKEN: optional Logfire write token for observability. When None,
     # logfire.configure() falls back to anonymous/local mode.
     LOGFIRE_TOKEN: str | None = None
+
+    @property
+    def guest_api_tokens(self) -> frozenset[str]:
+        """Guest tokens as a frozenset (empty when GUEST_API_TOKEN is unset)."""
+        return frozenset(self.GUEST_API_TOKEN)
 
     # ── Database ─────────────────────────────────────────────────────────
     # Full SQLAlchemy async connection URL for the external Postgres instance.

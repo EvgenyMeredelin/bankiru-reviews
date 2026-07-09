@@ -2,12 +2,15 @@
 
 This module defines all HTTP endpoints for the API service:
 
-  Public (no auth):
+  Unauthenticated:
     GET  /healthz              — Docker healthcheck (excluded from Logfire tracing)
     GET  /                     — redirect to /docs (Swagger UI)
-    GET  /reviews              — query reviews with filters, export to S3, summarize
 
-  Protected (API-Token header required):
+  GET /reviews:
+    Internal (no X-Bankiru-Gateway) — no token (Gradio UI after Authentik)
+    Via public Nginx gateway       — API-Token ∈ GUEST_API_TOKEN or API_TOKEN
+
+  Privileged (API-Token must match API_TOKEN; guests rejected):
     POST   /reviews            — bulk insert reviews (called by the parser)
     DELETE /reviews            — delete reviews by ID list
     DELETE /reviews/by-date    — delete reviews within a date range
@@ -15,14 +18,15 @@ This module defines all HTTP endpoints for the API service:
 
 The GET /reviews endpoint is the most complex: it builds a dynamic SQLAlchemy
 query from the filter parameters, optionally performs semantic search via
-pgvector, exports the results to S3 in the requested format, generates a
-pre-signed download URL, and runs the LLM summarization pipeline.
+pgvector, then either returns reviews inline (no outputFormat) or exports to
+S3. LLM summarization runs only when the effective ``summarize`` flag is true
+(default false on the public gateway, true for internal UI calls).
 
 Connection to other modules:
   - bankiru.api.schemas    — Pydantic models for request/response validation
   - bankiru.api.deps       — FastAPI dependencies (DBSession, BotoClient, api_token)
   - bankiru.api.handlers   — format-specific export handlers (CSV, JSON, Parquet, XLSX)
-  - bankiru.api.summarizer — LLM map-reduce summarization (called via handlers)
+  - bankiru.api.summarizer — LLM map-reduce summarization
   - bankiru.embedder       — embed_texts() for semantic search query embedding
   - bankiru.models         — Review and ReviewEmbedding ORM models
   - bankiru.config         — settings for S3 backup prefix, default model, etc.
@@ -41,11 +45,25 @@ from aiobotocore.client import AioBaseClient
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, insert, or_, select, text, tuple_
+from starlette.requests import Request as HttpRequest
 from starlette.responses import RedirectResponse
 
 from bankiru.api import schemas
-from bankiru.api.deps import BotoClient, DBSession, api_token
-from bankiru.api.schemas import Request, Response, available_output_formats
+from bankiru.api.deps import (
+    GATEWAY_HEADER,
+    GATEWAY_HEADER_VALUE,
+    BotoClient,
+    DBSession,
+    api_token,
+    guest_or_admin_token_if_gateway,
+)
+from bankiru.api.schemas import (
+    Response,
+    ReviewOut,
+    ReviewsQuery,
+    available_output_formats,
+)
+from bankiru.api.summarizer import summarize_map_reduce
 from bankiru.config import get_settings
 from bankiru.embedder import embed_texts, format_review_for_embedding
 from bankiru.models import Review, ReviewEmbedding
@@ -362,16 +380,40 @@ async def post_reviews(
 
     return {"inserted": inserted, "skipped": skipped_total}
 
+
+def _effective_summarize(r: ReviewsQuery, http_request: HttpRequest) -> bool:
+    """Resolve summarize: explicit query wins; else gateway→False, internal→True."""
+    if r.summarize is not None:
+        return r.summarize
+    is_gateway = (
+        http_request.headers.get(GATEWAY_HEADER) == GATEWAY_HEADER_VALUE
+    )
+    return not is_gateway
+
+
+def _response_base(r: ReviewsQuery, effective_summarize: bool) -> dict:
+    """Echo query fields with summarize set to the effective boolean."""
+    return {**r.model_dump(), "summarize": effective_summarize}
+
+
 # ── GET /reviews ─────────────────────────────────────────────────────────────
-# The main query endpoint. Called by the UI to fetch filtered reviews.
-# No authentication required — read access is public.
-@router.get("/reviews")
+# Main query endpoint. Internal UI calls need no token; requests proxied
+# through the public Nginx gateway must present a guest or admin API-Token.
+@router.get(
+    "/reviews",
+    response_model=Response,
+    dependencies=[Depends(guest_or_admin_token_if_gateway)],
+)
 async def get_reviews(
-    r: Annotated[Request, Query()],
+    http_request: HttpRequest,
+    r: Annotated[ReviewsQuery, Query()],
     session: DBSession,
     client: BotoClient,
 ):
-    """Query reviews with filters, export to S3, and summarize via LLM.
+    """Query reviews with filters; optionally export to S3 and/or summarize.
+
+    Auth: none for internal callers; via public gateway require API-Token
+    matching GUEST_API_TOKEN or API_TOKEN (see guest_or_admin_token_if_gateway).
 
     Query parameters (all optional):
       - startDate/endDate: date range filter (B-tree index on datePublished)
@@ -379,14 +421,15 @@ async def get_reviews(
       - product: list of product labels (exact match via IN clause)
       - location: list of city prefixes (startswith match)
       - keywords: free-text semantic search (pgvector cosine similarity)
-      - outputFormat: export format (csv/json/parquet/xlsx, default: parquet)
-      - cloudModel: LLM model for summarization (default from config)
+      - outputFormat: if omitted, return reviews inline; if set, S3 export
+      - summarize: if omitted, false on gateway / true internally
+      - cloudModel: LLM model when summarize is effective true
 
-    Returns a Response with:
-      - filename: S3 object key of the exported file
-      - url: pre-signed download URL (valid for 1 hour)
-      - comment: LLM-generated summary of the reviews
+    Returns a Response with either ``reviews`` (inline) or ``url``/``filename``
+    (export), plus optional ``comment`` (LLM summary or no-results message).
     """
+    effective_summarize = _effective_summarize(r, http_request)
+
     with logfire.span("Select entries"):
         # Build a list of WHERE clauses from the query parameters.
         # Only non-None parameters contribute a clause, so an empty query
@@ -437,7 +480,7 @@ async def get_reviews(
                     # Fail gracefully: return an error message instead of
                     # crashing. The user can retry without a semantic search query.
                     return Response(
-                        **r.model_dump(),
+                        **_response_base(r, effective_summarize),
                         comment=f"Semantic search unavailable: {exc}",
                     )
                 query_vector = query_vectors[0]
@@ -471,39 +514,45 @@ async def get_reviews(
         else:
             # ── Standard path (no semantic search query) ─────────────
             # Return all matching reviews sorted by date, URL, and product.
-            # No limit — the full result set is exported.
+            # No limit — the full result set is exported or returned inline.
             sort_order = [Review.datePublished, Review.url, Review.product]
             statement = select(Review).where(*clauses).order_by(*sort_order)
             result = await session.execute(statement)
 
-    # ── Export + summarize ────────────────────────────────────────────
-    with logfire.span("Pick a handler, handle reviews, return a response"):
-        # Extract ORM objects from the result set.
+    # ── Inline or export; optional summarize ──────────────────────────
+    with logfire.span("Handle reviews and return a response"):
         if not (scalars := result.scalars().all()):
             return Response(
-                **r.model_dump(),
+                **_response_base(r, effective_summarize),
                 comment="Your search did not match any reviews",
             )
 
-        # Instantiate the format-specific handler (CSVMaker, JSONMaker, etc.)
-        # based on the outputFormat query parameter. The handler converts
-        # ORM objects to a DataFrame, serializes to the target format,
-        # uploads to S3, and generates a pre-signed download URL.
+        comment: str | None = None
+        if effective_summarize:
+            with logfire.span("Summarize reviews"):
+                model_name = r.cloudModel or get_settings().DEFAULT_CLOUD_MODEL
+                # Deduplicate bodies (same as ScalarsHandler.summarize_reviews).
+                texts = list(dict.fromkeys(row.reviewBody for row in scalars))
+                summary = await summarize_map_reduce(texts, model_name=model_name)
+                comment = f"**Summary model:** `{model_name}`\n\n{summary}"
+
+        if r.outputFormat is None:
+            reviews = [ReviewOut.model_validate(row) for row in scalars]
+            return Response(
+                **_response_base(r, effective_summarize),
+                reviews=reviews,
+                comment=comment,
+            )
+
         handler_class = available_output_formats[r.outputFormat]
         handler = handler_class(scalars, client)
         await handler.upload_contents()
-
         url = await handler.generate_url()
-        # Use the explicitly requested model, or fall back to the default.
-        model_name = r.cloudModel or get_settings().DEFAULT_CLOUD_MODEL
-        # Run the LLM map-reduce summarization pipeline on the review texts.
-        comment = await handler.summarize_reviews(model_name)
-
         return Response(
-            **r.model_dump(),
+            **_response_base(r, effective_summarize),
             filename=handler.key,
             url=url,
-            comment=f"**Summary model:** `{model_name}`\n\n{comment}",
+            comment=comment,
         )
 
 

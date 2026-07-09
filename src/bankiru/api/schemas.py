@@ -2,9 +2,10 @@
 
 This module defines the data contracts for the API's HTTP endpoints:
 
-  - Review:   inbound model for POST /reviews (parser → API)
-  - Request:  query parameters for GET /reviews (UI → API)
-  - Response: outbound model for GET /reviews (API → UI)
+  - Review:       inbound model for POST /reviews (parser → API)
+  - ReviewsQuery: query parameters for GET /reviews (UI / public clients → API)
+  - ReviewOut:    one review in an inline GET /reviews response
+  - Response:     outbound model for GET /reviews
 
 The `datePublished` field on the inbound `Review` payload is annotated as
 `str` but the post-validation value is a `datetime`. The annotation is the
@@ -19,7 +20,7 @@ Auto-discovery of output formats:
 
 Connection to other modules:
   - bankiru.api.handlers — provides the format handler classes (CSVMaker, etc.)
-  - bankiru.api.routes   — uses Review for POST validation, Request/Response
+  - bankiru.api.routes   — uses Review for POST validation, ReviewsQuery/Response
                            for GET /reviews query/response
 """
 
@@ -29,7 +30,7 @@ import inspect
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from bankiru.api import handlers
 
@@ -50,7 +51,7 @@ available_output_formats = {
 outputFormats = Literal[tuple(available_output_formats)]  # type: ignore[valid-type]
 
 # Type alias for date fields that accept string, date, or None.
-# Used by Request.startDate and Request.endDate.
+# Used by ReviewsQuery.startDate and ReviewsQuery.endDate.
 date_value = str | date | None
 
 
@@ -81,11 +82,38 @@ class Review(BaseModel):
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
 
 
-class Request(BaseModel):
+class ReviewOut(BaseModel):
+    """One review row in an inline GET /reviews response (no S3 export)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    datePublished: str
+    reviewBody: str
+    bankName: str
+    url: str
+    location: str
+    product: str
+
+    @field_validator("datePublished", mode="before")
+    @classmethod
+    def format_datePublished(cls, value: object) -> str:
+        """Normalise ORM datetime / string to ``YYYY-MM-DD HH:MM:SS``."""
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        return str(value)
+
+
+class ReviewsQuery(BaseModel):
     """Query parameters for GET /reviews.
 
-    All fields are optional — an empty request returns all reviews.
-    The UI populates these from its filter dropdowns and text fields.
+    All fields are optional. When ``outputFormat`` is omitted, matching reviews
+    are returned inline in ``Response.reviews`` (no S3 file). When set, results
+    are exported and ``url`` is a pre-signed download link.
+
+    ``summarize`` is optional: ``None`` means "use context default" (false on
+    the public Nginx gateway, true for internal UI calls). The response echoes
+    the *effective* boolean after that resolution.
     """
     startDate: date_value = None       # inclusive start of date range
     endDate: date_value = None         # inclusive end of date range
@@ -93,8 +121,9 @@ class Request(BaseModel):
     location: list[str] | None = None  # filter by city prefix(es)
     product: list[str] | None = None   # filter by product label(s)
     keywords: str | None = None        # free-text semantic search query
-    outputFormat: outputFormats = "parquet"  # type: ignore[assignment]  # export format
-    cloudModel: str | None = None      # LLM model for summarization
+    outputFormat: outputFormats | None = None  # type: ignore[assignment]
+    summarize: bool | None = None      # None → gateway false / internal true
+    cloudModel: str | None = None      # LLM model when summarize is effective true
 
     @field_validator("startDate", "endDate", mode="before")
     @classmethod
@@ -116,14 +145,19 @@ class Request(BaseModel):
         return value
 
 
-class Response(Request):
+class Response(ReviewsQuery):
     """Response model for GET /reviews.
 
-    Extends Request (echo back the query parameters) with the export results:
-      - filename: S3 object key of the exported file
-      - url: pre-signed download URL (valid for 1 hour)
-      - comment: LLM-generated summary or error message
+    Extends ReviewsQuery (echo query parameters, with ``summarize`` resolved)
+    with either an S3 export or an inline review list:
+
+      - filename / url: set when ``outputFormat`` was provided
+      - reviews: set when ``outputFormat`` was omitted
+      - comment: LLM summary, no-results message, or null
     """
-    filename: str | None = None  # S3 object key (e.g. "uuid.parquet")
-    url: str | None = None       # pre-signed S3 download URL
-    comment: str | None = None   # LLM summary or status message
+    # Always the effective boolean (gateway/internal default already applied).
+    summarize: bool
+    filename: str | None = None
+    url: str | None = None
+    comment: str | None = None
+    reviews: list[ReviewOut] | None = None

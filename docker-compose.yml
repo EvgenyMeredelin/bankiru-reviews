@@ -40,12 +40,12 @@ services:
     <<: *env_file
     # Override the Dockerfile's default CMD to explicitly run the API module.
     command: ["python", "-m", "bankiru.api"]
-    # Publish the API port on all interfaces. The API is not gated by OIDC
-    # (read endpoints are public), but write endpoints require an API-Token
-    # header. The ${VAR:-default} syntax reads from the env file, falling
-    # back to 1706 if API_PORT is not set.
+    # Bind to loopback only. Public HTTPS access goes through the host Nginx
+    # vhost (bankiru.uva-advanced.ru → 127.0.0.1:API_PORT). Publishing on
+    # 0.0.0.0 would bypass the gateway token check (X-Bankiru-Gateway).
+    # Parser/UI still reach the API via the compose network (http://api:…).
     ports:
-      - "${API_PORT:-1706}:${API_PORT:-1706}"
+      - "127.0.0.1:${API_PORT:-1706}:${API_PORT:-1706}"
     # Docker healthcheck: a lightweight Python script that hits GET /healthz.
     # Using Python (not curl) avoids installing curl in the slim image.
     healthcheck:

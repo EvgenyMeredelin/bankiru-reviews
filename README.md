@@ -33,9 +33,10 @@
 - [Data model](#data-model)
   - [Embeddings table: `bankiru.review_embeddings`](#embeddings-table-bankiru-review-embeddings)
 - [API reference](#api-reference)
+  - [Public HTTPS API (guest tokens)](#public-https-api-guest-tokens)
   - [`GET /healthz` — health probe](#get-healthz--health-probe)
   - [`POST /reviews` — insert reviews](#post-reviews--insert-reviews)
-  - [`GET /reviews` — filter, export, and summarize](#get-reviews--filter-export-and-summarize)
+  - [`GET /reviews` — filter, export / inline, and optional summarize](#get-reviews--filter-export-and-summarize)
   - [`DELETE /reviews` — delete by ID](#delete-reviews--delete-by-id)
   - [`DELETE /reviews/by-date` — delete by date range](#delete-reviewsby-date--delete-by-date-range)
   - [`DELETE /reviews/duplicates` — deduplicate the table](#delete-reviewsduplicates--deduplicate-the-table)
@@ -98,17 +99,19 @@
 ```mermaid
 flowchart TD
     user(["User browser"]) -->|"HTTPS"| nginx["Nginx on host\n(TLS termination)"]
+    guest(["API client"]) -->|"HTTPS + API-Token"| nginx
 
     subgraph stack [Docker Compose stack: bankiru-reviews]
       direction TB
       ui["ui\nGradio + OIDC"]
       api["api\nFastAPI"]
       parser["parser\nAPScheduler"]
-      ui -->|"GET /reviews"| api
-      parser -->|"POST /reviews"| api
+      ui -->|"GET /reviews\nno token"| api
+      parser -->|"POST /reviews\nAPI_TOKEN"| api
     end
 
     nginx -->|"127.0.0.1:17060"| ui
+    nginx -->|"127.0.0.1:1706\n/reviews /docs /healthz"| api
     ui <-->|"OIDC"| authentik(("Authentik"))
     api -->|"SQLAlchemy"| postgres[("Postgres\nreviews + embeddings")]
     api -->|"put_object\npresigned_url"| s3[("S3 / OBS")]
@@ -119,9 +122,11 @@ flowchart TD
 **Request path for a UI query:**
 
 1. Browser → Nginx (TLS) → `ui` service (`127.0.0.1:17060`).
-2. Gradio calls `GET /reviews` on the `api` service (internal compose network).
-3. `api` queries Postgres, serialises to the requested format, uploads to S3, generates a pre-signed URL, runs the LLM summarizer, and returns a JSON body with `{url, comment}` (the summary header includes `**Summary model:**` and the model name).
+2. Gradio calls `GET /reviews` on the `api` service (internal compose network, no `API-Token`), always with an explicit `outputFormat` (default dropdown: `parquet`).
+3. `api` queries Postgres, uploads the export to S3, generates a pre-signed URL, and (internal default) runs the LLM summarizer — JSON body `{url, comment, …}` (`reviews` is null when exporting).
 4. UI renders the summary in the Markdown panel; the "Download reviews" button opens the pre-signed URL in a new browser tab — **the browser fetches the file directly from OBS**, no server round-trip. The "Download summary" button saves the summary as a local `.md` file (client-side Blob, no server round-trip).
+
+**Request path for an external API client:** Browser/script → Nginx (TLS) → `api` (`127.0.0.1:1706`) with `API-Token` (guest or admin). On the public gateway, omitting `outputFormat` returns reviews **inline** in `reviews`, and `summarize` defaults to **false**. Full guide: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
 
 ---
 
@@ -130,9 +135,9 @@ flowchart TD
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. On startup: `create_all_tables()` (blocks while building a missing HNSW index), then a background embedding backfill. Each POST merges rows into per-`datePublished` Parquet files under `bankiru-reviews/` (new inserts and all-skipped retries; multi-day batches split by review date). DELETE does not prune OBS. |
+| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter; inline JSON or S3 export; optional summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. Bound to `127.0.0.1:API_PORT` on the host; public HTTPS via Nginx. On startup: `create_all_tables()` (blocks while building a missing HNSW index), then a background embedding backfill. Each POST merges rows into per-`datePublished` Parquet files under `bankiru-reviews/` (new inserts and all-skipped retries; multi-day batches split by review date). DELETE does not prune OBS. |
 | `parser` | Same image, `command: python -m bankiru.parser` | APScheduler cron job. Crawls banki.ru once daily, collects negative reviews for the previous `PARSER_DAYS` days, and POSTs the deduplicated batch to the `api`. |
-| `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
+| `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network **without** `API-Token`. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
 | External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is bootstrapped at `api` startup via `create_all_tables()` (pgvector extension, ORM tables, B-tree indexes, HNSW index via `ensure_hnsw_index()` — idempotent when valid; building a missing HNSW index blocks readiness). |
 | External: S3 / OBS | (managed elsewhere) | Stores named export files (pre-signed 1-hour URLs) and daily Parquet backups (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`). |
 | External: Authentik | `https://uva-advanced.ru` | OIDC identity provider for the UI login flow. |
@@ -191,7 +196,21 @@ Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 <a id="api-reference"></a>
 ## API reference · [↑](#toc)
 
-Base URL (in compose): `http://api:1706`. Externally: `http://localhost:1706` (port published on all interfaces by default).
+Base URL (in compose): `http://api:1706`. On the host loopback: `http://127.0.0.1:1706` (not published on `0.0.0.0`). Public HTTPS: `https://bankiru.uva-advanced.ru` (Nginx → api for `/reviews`, `/docs`, `/healthz`, …).
+
+<a id="public-https-api-guest-tokens"></a>
+### Public HTTPS API (guest tokens) · [↑](#toc)
+
+External clients use **`https://bankiru.uva-advanced.ru`**. Full Russian guide: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
+
+| Path | Auth |
+|------|------|
+| `GET /reviews` via Nginx | `API-Token` ∈ `GUEST_API_TOKEN` **or** `API_TOKEN` (Nginx sets `X-Bankiru-Gateway`) |
+| `GET /reviews` from UI / compose network | No token (no gateway header) |
+| `POST` / `DELETE` `/reviews*` | `API-Token` must match **`API_TOKEN` only** (guest tokens → 403) |
+| `GET /healthz`, `/docs`, `/redoc`, `/openapi.json` | No token |
+
+Deploy order: recreate `api` (loopback bind + gateway auth) **before** reloading the Nginx conf that proxies `/reviews`.
 
 <a id="get-healthz--health-probe"></a>
 ### `GET /healthz` — health probe · [↑](#toc)
@@ -201,7 +220,7 @@ No auth. Returns `{"status": "ok"}`. Used by Docker's `healthcheck`.
 <a id="post-reviews--insert-reviews"></a>
 ### `POST /reviews` — insert reviews · [↑](#toc)
 
-**Auth:** `API-Token` header (matches `API_TOKEN`).
+**Auth:** `API-Token` header (must match `API_TOKEN`; guest tokens rejected).
 
 **Body:** JSON array of Review objects.
 
@@ -223,9 +242,9 @@ Dedupes the request body and skips pairs already stored under `(url, product)` (
 An empty JSON array (`[]`) is accepted and also returns `201` without touching the database or S3. If embedding generation fails for a batch, the reviews are still saved; missing embeddings are backfilled on the next API restart (see [Semantic search](#semantic-search)).
 
 <a id="get-reviews--filter-export-and-summarize"></a>
-### `GET /reviews` — filter, export, and summarize · [↑](#toc)
+### `GET /reviews` — filter, export / inline, and optional summarize · [↑](#toc)
 
-**Auth:** None (read-only; the UI does not send the API token).
+**Auth:** None for internal callers (UI over the compose network). Via the public Nginx gateway: `API-Token` must match `GUEST_API_TOKEN` or `API_TOKEN`.
 
 **Query parameters** (all optional):
 
@@ -237,10 +256,11 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
 | `location` | repeatable string | Include only reviews whose `location` starts with one of the given prefixes. Useful for matching a city when the stored value includes district suffixes. |
 | `product` | repeatable string | Exact match on `product`. |
 | `keywords` | `string` | Free-text semantic search (UI label: **Semantic search**). When provided, the query is embedded with the BGE-M3 **query** prefix, reviews are ranked by cosine similarity (HNSW via pgvector), optionally filtered by `SEMANTIC_SEARCH_MAX_DISTANCE`, and capped at `SEMANTIC_SEARCH_LIMIT` (default 200). Combinable with all other filters. |
-| `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | Default: `parquet`. |
-| `cloudModel` | string | Override the summarization model. Default: `DEFAULT_CLOUD_MODEL`. The UI dropdown label is **Summary model**; the query parameter name is unchanged. |
+| `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | **If omitted:** return matching rows inline in `reviews` (`url`/`filename` null). **If set:** export to S3 and return a pre-signed `url` (`reviews` null). Breaking change vs older default-`parquet` behaviour. The Gradio UI always sends an explicit format. |
+| `summarize` | `bool` | If omitted: **`false`** on the public Nginx gateway, **`true`** for internal (UI) calls. Explicit `true`/`false` always wins. Response echoes the *effective* value. |
+| `cloudModel` | string | Summarization model when effective `summarize` is true. Default: `DEFAULT_CLOUD_MODEL`. UI label: **Summary model**. |
 
-**Successful response** (JSON):
+**Successful response** (export + summarize example):
 
 ```json
 {
@@ -251,19 +271,21 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
   "location": null,
   "keywords": null,
   "outputFormat": "xlsx",
+  "summarize": true,
   "cloudModel": "anthropic/claude-sonnet-4.6",
   "filename": "a1b2c3d4-….xlsx",
   "url": "https://obs.cloud.ru/…?X-Amz-Expires=3600…",
-  "comment": "**Summary model:** `anthropic/claude-sonnet-4.6`\n\n## Наиболее острые темы…"
+  "comment": "**Summary model:** `anthropic/claude-sonnet-4.6`\n\n## Наиболее острые темы…",
+  "reviews": null
 }
 ```
 
-`url` is a **pre-signed S3 URL** (valid ~1 hour). `comment` contains the LLM summary in Markdown. If no reviews match, `url` and `filename` are `null` and `comment` holds a "no results" message.
+When `outputFormat` is omitted, `reviews` is a list of review objects and `url`/`filename` are `null`. If no reviews match, `reviews`/`url`/`filename` are `null` and `comment` is a "no results" message (even when `summarize` is false). Public HTTPS details and curl/HTTPie examples: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
 
 <a id="delete-reviews--delete-by-id"></a>
 ### `DELETE /reviews` — delete by ID · [↑](#toc)
 
-**Auth:** `API-Token` header.
+**Auth:** `API-Token` header (must match `API_TOKEN`; guest tokens rejected).
 
 **Body:** JSON array of integer IDs, e.g. `[42, 43, 44]`. Deletes the matching rows and commits.
 
@@ -272,7 +294,7 @@ Returns `204 No Content`.
 <a id="delete-reviewsby-date--delete-by-date-range"></a>
 ### `DELETE /reviews/by-date` — delete by date range · [↑](#toc)
 
-**Auth:** `API-Token` header.
+**Auth:** `API-Token` header (must match `API_TOKEN`; guest tokens rejected).
 
 **Query parameters** (both required):
 
@@ -289,13 +311,13 @@ Returns `204 No Content`.
 
 ```bash
 curl -s -X DELETE -H "API-Token: $API_TOKEN" \
-  "http://localhost:1706/reviews/by-date?startDate=2026-05-17&endDate=2026-05-18"
+  "http://127.0.0.1:1706/reviews/by-date?startDate=2026-05-17&endDate=2026-05-18"
 ```
 
 <a id="delete-reviewsduplicates--deduplicate-the-table"></a>
 ### `DELETE /reviews/duplicates` — deduplicate the table · [↑](#toc)
 
-**Auth:** `API-Token` header.
+**Auth:** `API-Token` header (must match `API_TOKEN`; guest tokens rejected).
 
 Keeps the row with the lowest `id` per `(reviewBody, product)` pair (grouped by `md5(reviewBody)` to keep the hash table small). Deletes everything else. The query uses a CTE to materialise keeper IDs first, then performs an integer-only `NOT IN` delete. Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. A per-statement timeout of 300 s is set so a slow query surfaces as an error instead of hanging indefinitely.
 
@@ -658,16 +680,18 @@ Copy the Client ID and Client Secret into Infisical as `OIDC_CLIENT_ID` / `OIDC_
 <a id="security-hardening"></a>
 ## Security hardening · [↑](#toc)
 
-Eight defense-in-depth measures over a vanilla Authlib-on-Starlette template:
+Defense-in-depth over a vanilla Authlib-on-Starlette template, plus API edge controls:
 
 1. **Pinned `redirect_uri`** (`OIDC_REDIRECT_URI` from config, not derived from request headers). Defeats header-spoofed open-redirect / auth-code-injection scenarios if `TRUSTED_HOSTS` drifts.
 2. **RP-initiated logout** — `/logout` reads `end_session_endpoint` from the OIDC discovery document and redirects with `id_token_hint` + `post_logout_redirect_uri`, terminating the Authentik SSO session (not just the local cookie).
 3. **Session rotation** — `request.session.clear()` before writing identity on `/auth`.
 4. **Narrow session payload** — only `{sub, username, email, id_token}` stored (not the full `userinfo` dict). Avoids 4 KB cookie corruption; limits what is base64-readable.
-5. **UI auto-docs disabled** — `docs_url=None, redoc_url=None, openapi_url=None` on the UI FastAPI app. The `api` service keeps its Swagger docs (public contract).
+5. **UI auto-docs disabled** — `docs_url=None, redoc_url=None, openapi_url=None` on the UI FastAPI app. The `api` service keeps its Swagger docs (public contract at `/docs`).
 6. **Explicit `OAuthError` handling** — authentication failures log a warning via Logfire and redirect to `/login` instead of surfacing a 500.
 7. **Security headers at the Nginx edge** — HSTS (`max-age=31536000; includeSubDomains`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN` (not `DENY` — Gradio uses iframes internally), `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(), microphone=(), camera=()`.
 8. **Dotfile blocking at the edge** — `location ~ /\.` returns 403 for any request containing a dotfile segment (`.env`, `.git/`, `.htaccess`, etc.); `access_log off; log_not_found off` silences scanner noise. A nested exception lets `/.well-known/` through for ACME challenges.
+9. **API loopback bind** — compose publishes `api` as `127.0.0.1:API_PORT` only, so the REST port is not reachable from the public internet except through Nginx.
+10. **Gateway guest tokens** — Nginx overwrites `X-Bankiru-Gateway` on `/reviews`; the API then requires `API-Token` ∈ `GUEST_API_TOKEN` or `API_TOKEN` for GET. Write routes accept **`API_TOKEN` only**. The Gradio UI (already behind Authentik) calls the API over the compose network without a token.
 
 **Explicitly NOT done** (with rationale):
 
@@ -675,6 +699,7 @@ Eight defense-in-depth measures over a vanilla Authlib-on-Starlette template:
 - **Cookie encryption**: signing is sufficient given the narrowed payload.
 - **`/login` rate limiting**: delegated to Authentik's brute-force protection.
 - **HSTS preload**: opt in manually once long-term cert renewal is proven stable.
+- **OIDC on REST**: external API clients use shared guest tokens instead.
 
 ---
 
@@ -688,7 +713,9 @@ bankiru-reviews/
 │   ├── bankiru-logo.svg            # wordmark (black text)
 │   └── bankiru-logo-white.svg      # wordmark (white text; README header)
 ├── config/
-│   └── bankiru-reviews.conf        # Nginx vhost (TLS, ACME, Gradio SSE/WS proxy)
+│   └── bankiru-reviews.conf        # Nginx vhost (TLS, UI + API proxy, Gradio SSE/WS)
+├── docs/
+│   └── bankiru-reviews-public-api.md  # RU guide for https://bankiru.uva-advanced.ru API
 ├── docker-compose.yml              # api + parser + ui; single shared env_file on tmpfs
 ├── Dockerfile                      # one image, three CMDs; uv, python:3.13-slim
 ├── pyproject.toml                  # single uv project; src layout; hatchling build
@@ -762,7 +789,7 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `API_TOKEN` | api, parser | Shared secret on the `API-Token` header for `POST /reviews` and `DELETE /reviews`. |
+| `API_TOKEN` | api, parser | Privileged secret on the `API-Token` header for `POST`/`DELETE` `/reviews*` and for gateway `GET /reviews`. |
 | `POSTGRES_URL` | api | `postgresql+psycopg://user:pass@host/db`. |
 | `OBS_BUCKET` | api | S3 bucket name. |
 | `OBS_ACCESS_KEY` | api | S3 access key. |
@@ -779,8 +806,9 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOGFIRE_TOKEN` | `None` | Logfire ingestion token. Omit for local dev (no-op). |
+| `GUEST_API_TOKEN` | `[]` (empty) | Comma-separated read-only tokens for `GET /reviews` via `https://bankiru.uva-advanced.ru`. Guests cannot `POST`/`DELETE`. Empty → only `API_TOKEN` accepted on the gateway GET path. |
 | `OBS_BACKUP_PREFIX` | `bankiru-reviews` | S3 key prefix (subfolder) for daily Parquet backups. Files are written as `{prefix}/bankiru-reviews-YYYY-MM-DD.parquet`. |
-| `API_PORT` | `1706` | API listen port. If changed, also update `CREATE_REVIEWS_ENDPOINT` and `GET_REVIEWS_URL`. |
+| `API_PORT` | `1706` | API listen port (bound to `127.0.0.1` on the host). If changed, also update `CREATE_REVIEWS_ENDPOINT`, `GET_REVIEWS_URL`, and the Nginx upstream port in `config/bankiru-reviews.conf`. |
 | `UI_PORT` | `17060` | UI listen port (bound to `127.0.0.1` on the host). |
 | `CREATE_REVIEWS_ENDPOINT` | `http://api:1706/reviews` | Where the parser POSTs batches. |
 | `GET_REVIEWS_URL` | `http://api:1706/reviews` | Where the UI GETs filtered exports. |
@@ -837,21 +865,22 @@ sudo apt-get update && sudo apt-get install -y infisical
 git clone <repo-url> ~/git/bankiru-reviews
 cd ~/git/bankiru-reviews
 
-# 3. Provision the Nginx vhost on the host (not in Docker)
+# 3. Register the OIDC client in Authentik (see "UI and authentication" above);
+#    populate OIDC_CLIENT_ID / OIDC_CLIENT_SECRET / GUEST_API_TOKEN in Infisical.
+
+# 4. Start the stack (prompts for the Infisical client secret)
+./scripts/start.sh
+
+# 5. Provision / reload the Nginx vhost AFTER api is up with loopback + gateway auth
 sudo cp config/bankiru-reviews.conf /etc/nginx/conf.d/bankiru.conf
 sudo certbot certonly --webroot -w /var/www/html \
      -d bankiru.uva-advanced.ru -d www.bankiru.uva-advanced.ru
 sudo nginx -t && sudo systemctl reload nginx
 
-# 4. Register the OIDC client in Authentik (see "UI and authentication" above);
-#    populate OIDC_CLIENT_ID / OIDC_CLIENT_SECRET in Infisical.
-
-# 5. Start the stack (prompts for the Infisical client secret)
-./scripts/start.sh
-
 # 6. Verify
 docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env ps
-curl http://localhost:1706/healthz   # {"status": "ok"}
+curl http://127.0.0.1:1706/healthz   # {"status": "ok"}
+curl -sS https://bankiru.uva-advanced.ru/healthz
 open https://bankiru.uva-advanced.ru
 ```
 
@@ -942,10 +971,10 @@ import asyncio; from bankiru.parser.runner import run_once; asyncio.run(run_once
 
 # Delete reviews for a date range (e.g. May 17–18; both dates inclusive)
 curl -s -X DELETE -H "API-Token: $API_TOKEN" \
-  "http://localhost:1706/reviews/by-date?startDate=2026-05-17&endDate=2026-05-18"
+  "http://127.0.0.1:1706/reviews/by-date?startDate=2026-05-17&endDate=2026-05-18"
 
 # Deduplicate the database (keeps lowest id per reviewBody+product)
-curl -s -X DELETE -H "API-Token: $API_TOKEN" http://localhost:1706/reviews/duplicates
+curl -s -X DELETE -H "API-Token: $API_TOKEN" http://127.0.0.1:1706/reviews/duplicates
 
 # Backfill missing embeddings (manual, if startup backfill failed)
 docker exec bankiru-api python -m bankiru.embedder backfill
@@ -1249,7 +1278,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 <a id="назначение"></a>
 ### Назначение · [↑](#toc)
 
-Централизованный сбор, хранение и анализ негативных отзывов и претензий к российским банкам с портала [banki.ru](https://www.banki.ru) (оценки 1–2 звезды): фильтрация, семантический поиск, выгрузка в объектное хранилище и LLM-суммаризация через веб-интерфейс с входом через Authentik (OIDC).
+Централизованный сбор, хранение и анализ негативных отзывов и претензий к российским банкам с портала [banki.ru](https://www.banki.ru) (оценки 1–2 звезды): фильтрация, семантический поиск, выгрузка в объектное хранилище или inline JSON, опциональная LLM-суммаризация — через веб-интерфейс (Authentik/OIDC) и публичный REST API с гостевыми токенами (`GUEST_API_TOKEN`).
 
 <a id="парсер-и-источник-данных"></a>
 ### Парсер и источник данных · [↑](#toc)
@@ -1277,15 +1306,15 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 | Эндпоинт | Аутентификация | Назначение |
 |----------|----------------|------------|
-| `GET /healthz` | нет | Проверка живости (Docker healthcheck) |
+| `GET /healthz` | нет | Проверка доступности (Docker healthcheck) |
 | `GET /` | нет | Редирект на `/docs` (Swagger) |
-| `POST /reviews` | заголовок `API-Token` | Приём пакета: дедуп и пропуск уже сохранённых `(url, product)` (без upsert), INSERT, inline-эмбеддинги, мерж в Parquet по `datePublished` (в т.ч. all-skipped retry). Ответ всегда `{"inserted", "skipped"}` (в т.ч. `[]` → нули). |
-| `GET /reviews` | **нет (публичный)** | Фильтры, выгрузка (csv/json/parquet/xlsx), pre-signed URL, LLM-суммаризация |
-| `DELETE /reviews` | `API-Token` | Удаление по списку ID |
-| `DELETE /reviews/by-date` | `API-Token` | Удаление по диапазону дат (включительно) |
-| `DELETE /reviews/duplicates` | `API-Token` | Дедупликация таблицы (остаётся строка с минимальным `id`) |
+| `POST /reviews` | `API-Token` = `API_TOKEN` | Приём пакета: дедуп и пропуск уже сохранённых `(url, product)` (без upsert), INSERT, inline-эмбеддинги, мерж в Parquet по `datePublished` (в т.ч. all-skipped retry). Ответ всегда `{"inserted", "skipped"}` (в т.ч. `[]` → нули). |
+| `GET /reviews` | внутри сети — нет; через Nginx — гостевой или `API_TOKEN` | Фильтры; без `outputFormat` — inline `reviews`, с форматом — файл в S3; `summarize` по умолчанию false на шлюзе / true внутри. Публичный URL: `https://bankiru.uva-advanced.ru` (см. [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md)) |
+| `DELETE /reviews` | только `API_TOKEN` | Удаление по списку ID |
+| `DELETE /reviews/by-date` | только `API_TOKEN` | Удаление по диапазону дат (включительно) |
+| `DELETE /reviews/duplicates` | только `API_TOKEN` | Дедупликация таблицы (остаётся строка с минимальным `id`) |
 
-**Фильтры `GET /reviews`:** диапазон дат; банк и продукт — точное совпадение; город — префикс (`startswith`).
+**Фильтры `GET /reviews`:** диапазон дат; банк и продукт — точное совпадение; город — префикс (`startswith`). Порт API на хосте слушает только `127.0.0.1`. Без `outputFormat` ответ содержит список в `reviews` (не Parquet по умолчанию).
 
 <a id="семантический-поиск"></a>
 ### Семантический поиск · [↑](#toc)
@@ -1362,7 +1391,7 @@ Gradio + FastAPI + Authentik OIDC. На хосте слушает только `
 
 Authentik (OIDC): фиксированный `OIDC_REDIRECT_URI`, RP-initiated logout с `id_token_hint`, сессия `{sub, username, email, id_token}`. На Nginx — HSTS, `X-Content-Type-Options`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`, блокировка dotfile-запросов. Swagger на сервисе `ui` отключён.
 
-**Важно:** `GET /reviews` на сервисе `api` **не требует токена** — учитывайте при публикации порта API.
+**API:** порт `api` на хосте слушает только `127.0.0.1`. Внутри compose-сети UI вызывает `GET /reviews` без токена; с улицы через Nginx нужен гостевой или `API_TOKEN` (см. [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md)).
 
 <a id="инфраструктура-и-секреты"></a>
 ### Инфраструктура и секреты · [↑](#toc)
@@ -1397,10 +1426,10 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 
 - **Собирает** отзывы с оценками 1–2 звезды по 23 банковским продуктам (12 для физлиц, 11 для юрлиц) — ежедневно, по расписанию.
 - **Хранит** отзывы в PostgreSQL с метаданными (дата, банк, продукт, город, URL) и отдельной таблицей pgvector-эмбеддингов для семантического поиска.
-- **Выгружает** результаты в форматах CSV, JSON, Parquet и XLSX с загрузкой в S3-совместимое хранилище (Cloud.ru OBS) и выдачей pre-signed ссылки на скачивание.
-- **Суммаризирует** отзывы с помощью LLM (Cloud.ru Foundation Models, OpenAI-совместимый API) по схеме map-reduce — поддерживается любой объём данных.
+- **Выгружает** результаты в CSV, JSON, Parquet и XLSX (S3/OBS + pre-signed URL) либо отдаёт отзывы **inline** в JSON, если `outputFormat` не указан.
+- **Суммаризирует** отзывы с помощью LLM (Cloud.ru Foundation Models, OpenAI-совместимый API) по схеме map-reduce — поддерживается любой объём данных; на публичном шлюзе `summarize` по умолчанию выключен.
 - **Ищет семантически** — встроенный векторный поиск на базе pgvector (BAAI/bge-m3, 1024 измерения, HNSW-индекс) позволяет находить отзывы по смыслу, а не только по ключевым словам.
-- **Защищает доступ** через Authentik (OIDC) — вход в веб-интерфейс только для авторизованных пользователей.
+- **Защищает доступ** — веб-UI через Authentik (OIDC); публичный `GET /reviews` — гостевой или привилегированный `API-Token` (см. [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md)).
 
 <a id="архитектура"></a>
 ### Архитектура · [↑](#toc)
@@ -1409,7 +1438,7 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 
 | Сервис | Роль |
 |--------|------|
-| **api** | REST API (FastAPI): приём, хранение, фильтрация, выгрузка и суммаризация отзывов |
+| **api** | REST API (FastAPI): приём, хранение, фильтрация, inline JSON или выгрузка в S3, опциональная суммаризация; публичный `GET /reviews` по гостевому токену |
 | **parser** | Ежедневный краулер banki.ru (APScheduler): сбор отзывов и отправка в API |
 | **ui** | Веб-интерфейс (Gradio + FastAPI): фильтры, семантический поиск, скачивание файлов и резюме |
 
@@ -1420,10 +1449,10 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 
 - **Фильтрация** по дате, банку, продукту и городу (префиксный поиск).
 - **Семантический поиск** — текстовый запрос кодируется моделью BGE-M3 и сравнивается с векторами отзывов через HNSW-индекс pgvector.
-- **Четыре формата выгрузки** — CSV, JSON, Parquet, XLSX (с цветовой группировкой строк).
-- **LLM-суммаризация** — рекурсивный map-reduce, автоматический подбор размера чанков под контекстное окно модели.
+- **Четыре формата выгрузки** — CSV, JSON, Parquet, XLSX (с цветовой группировкой строк); без `outputFormat` — inline JSON в `reviews`.
+- **LLM-суммаризация** — рекурсивный map-reduce, автоматический подбор размера чанков под контекстное окно модели (на публичном API по умолчанию выключена).
 - **Автоматический бэкап** — вставленные строки мержатся в Parquet по дате отзыва (`datePublished`) в OBS.
-- **Безопасность** — секреты в tmpfs (Infisical), OIDC-аутентификация, HSTS, блокировка dotfile-запросов на Nginx.
+- **Безопасность** — секреты в tmpfs (Infisical), OIDC для UI, гостевые токены для публичного REST, API на loopback, HSTS, блокировка dotfile-запросов на Nginx.
 - **Наблюдаемость** — Logfire (OpenTelemetry): структурированные логи и трейсы для всех сервисов.
 - **Расширяемость** — новый формат выгрузки добавляется одним классом-наследником `*Maker`; регистрация автоматическая.
 
