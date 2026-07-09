@@ -38,8 +38,9 @@ from typing import Annotated
 import logfire
 import pandas as pd
 from aiobotocore.client import AioBaseClient
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import delete, func, insert, or_, select, text
+from botocore.exceptions import ClientError
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import delete, func, insert, or_, select, text, tuple_
 from starlette.responses import RedirectResponse
 
 from bankiru.api import schemas
@@ -78,52 +79,91 @@ async def _backup_daily_batch(
     rows: list[dict],
     client: AioBaseClient,
 ) -> None:
-    """Serialize the POSTed batch to Parquet and upload to S3 as a daily backup.
+    """Merge newly inserted rows into date-stamped Parquet backups on S3.
 
-    This creates a date-stamped Parquet file in the S3 backup prefix, e.g.:
-      bankiru-reviews/bankiru-reviews-2025-06-01.parquet
+    Key shape::
+      {OBS_BACKUP_PREFIX}/bankiru-reviews-{YYYY-MM-DD}.parquet
 
-    The backup serves as an immutable audit trail of what the parser collected
-    each day. If the same date is crawled twice, the second upload overwrites
-    the first (S3 PUT is idempotent by key).
+    Rows are grouped by ``datePublished`` calendar date (review date, not
+    crawl/POST day). Each group merges into its own object: download if
+    present, concatenate, drop duplicate ``(url, product)`` pairs keeping
+    the latest row. Multi-day backfills therefore land in the correct
+    per-date files; a second POST that inserts more rows for an existing
+    review date accumulates instead of overwriting.
 
-    *rows* is the same ``list[dict]`` already prepared for the bulk INSERT,
-    so no extra ``model_dump()`` call is needed.  Parquet serialization is
-    CPU-bound and is offloaded to a thread to keep ``/healthz`` responsive.
+    *rows* is the in-batch-deduped payload (newly inserted and/or already
+    stored pairs). Callers use it both after insert and on all-skipped
+    retries so a prior OBS miss can heal. Parquet work is offloaded to a
+    thread for ``/healthz``.
 
     Args:
-        rows: List of review dicts (already validated by Pydantic).
-        client: Async S3 client for uploading the backup file.
+        rows: Review dicts to merge (already validated by Pydantic).
+        client: Async S3 client for download/upload.
     """
     settings = get_settings()
 
-    def _serialize() -> tuple[io.BytesIO, str]:
-        """CPU-bound: convert rows to Parquet bytes. Runs in a thread."""
-        df = pd.DataFrame.from_records(rows)
-        # datePublished is already a datetime (validated by Pydantic);
-        # extract the date and pick the most common one for the filename.
-        # This ensures the backup filename reflects the actual review dates,
-        # not the date the crawl ran.
+    def _group_by_review_date(rows_local: list[dict]) -> dict[str, list[dict]]:
+        """Split rows into {ISO date -> row dicts} by datePublished."""
+        df = pd.DataFrame.from_records(rows_local)
         dates = pd.to_datetime(df["datePublished"]).dt.date
-        backup_date = dates.mode().iloc[0] if not dates.empty else date.today()
-        buf = io.BytesIO()
-        df.to_parquet(buf, index=False)
-        buf.seek(0)
-        return buf, backup_date.isoformat()
+        grouped: dict[str, list[dict]] = {}
+        for date_val, group in df.groupby(dates, sort=False):
+            key = (
+                date_val.isoformat()
+                if hasattr(date_val, "isoformat")
+                else date.today().isoformat()
+            )
+            grouped[key] = group.to_dict(orient="records")
+        return grouped
 
-    # Offload serialization to a thread so the event loop stays responsive
-    # (important for /healthz during large batch processing).
-    buf, date_str = await asyncio.to_thread(_serialize)
+    by_date = await asyncio.to_thread(_group_by_review_date, rows)
 
-    # Upload to S3 with a deterministic key (date-based). Overwrites any
-    # existing backup for the same date (idempotent).
-    key = f"{settings.OBS_BACKUP_PREFIX}/bankiru-reviews-{date_str}.parquet"
-    await client.put_object(
-        Bucket=settings.OBS_BUCKET,
-        Key=key,
-        Body=buf,
-        ContentType="application/vnd.apache.parquet",
-    )
+    for date_str, date_rows in by_date.items():
+        key = f"{settings.OBS_BACKUP_PREFIX}/bankiru-reviews-{date_str}.parquet"
+
+        existing_bytes: bytes | None = None
+        try:
+            resp = await client.get_object(Bucket=settings.OBS_BUCKET, Key=key)
+            # Enter Body only for connection cleanup; read via StreamingBody
+            # (``async with Body as stream`` yields aiohttp ClientResponse).
+            body = resp["Body"]
+            async with body:
+                existing_bytes = await body.read()
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in {"404", "NoSuchKey", "NotFound"}:
+                raise
+            # First backup for this date — nothing to merge.
+
+        def _serialize(
+            existing: bytes | None,
+            new_rows: list[dict] = date_rows,
+        ) -> io.BytesIO:
+            """CPU-bound: merge + Parquet encode. Runs in a thread."""
+            new_df = pd.DataFrame.from_records(new_rows)
+            if existing is not None:
+                old_df = pd.read_parquet(io.BytesIO(existing))
+                merged = pd.concat([old_df, new_df], ignore_index=True)
+            else:
+                merged = new_df
+            # Keep the last occurrence so a re-insert of the same pair (after a
+            # manual delete) refreshes the backup row.
+            if {"url", "product"}.issubset(merged.columns):
+                merged = merged.drop_duplicates(
+                    subset=["url", "product"], keep="last"
+                )
+            buf = io.BytesIO()
+            merged.to_parquet(buf, index=False)
+            buf.seek(0)
+            return buf
+
+        buf = await asyncio.to_thread(_serialize, existing_bytes)
+        await client.put_object(
+            Bucket=settings.OBS_BUCKET,
+            Key=key,
+            Body=buf,
+            ContentType="application/vnd.apache.parquet",
+        )
 
 
 # ── POST /reviews ────────────────────────────────────────────────────────────
@@ -143,17 +183,33 @@ async def post_reviews(
 
     Processing steps:
       1. Validate reviews via Pydantic (automatic via FastAPI)
-      2. Bulk INSERT all reviews in a single SQL statement
-      3. Generate vector embeddings for the new reviews (for semantic search)
-      4. Upload a Parquet backup of the batch to S3
+      2. Dedupe the batch and skip pairs already stored under (url, product)
+         — one review page may yield multiple rows (one per product tag);
+         there is intentionally no UNIQUE on url
+      3. Bulk INSERT remaining rows in a single SQL statement
+      4. Generate vector embeddings for the new reviews (for semantic search)
+      5. Merge rows into per-datePublished Parquet backups on S3 (best-effort)
 
-    If embedding generation fails, the reviews are still inserted — missing
-    embeddings will be backfilled on the next API restart (see app.py lifespan).
+    Returns ``{"inserted": N, "skipped": M}`` (including empty ``[]`` →
+    ``{"inserted": 0, "skipped": 0}``). If embedding generation fails, the
+    reviews are still inserted — missing embeddings will be backfilled on
+    the next API restart (see app.py lifespan).
+
+    Already-stored ``(url, product)`` pairs are skipped, not updated: a
+    re-crawl does not refresh ``reviewBody`` / ``location`` / ``bankName``.
+    Idempotency is application-level (safe for the serial parser); concurrent
+    POSTs of the same pair can still race without a DB unique constraint.
+
+    S3 backup is best-effort relative to Postgres (reviews stay committed
+    if PutObject fails) but the request returns **503** on backup failure
+    so the parser retries. An all-skipped POST still merges the payload
+    into OBS; failure there also returns 503. DELETE endpoints do not
+    prune OBS.
     """
     # Fast path: an empty JSON array is valid but there is nothing to insert,
-    # embed, or back up. Return 201 with no body instead of running empty SQL.
+    # embed, or back up. Same response shape as an all-skipped batch.
     if not reviews:
-        return None
+        return {"inserted": 0, "skipped": 0}
 
     with logfire.span("Create new entries"):
         # Validate via Pydantic, then pass raw dicts straight to a bulk
@@ -163,18 +219,84 @@ async def post_reviews(
         # round-trip regardless of batch size.
         rows = [r.model_dump() for r in reviews]
 
+    with logfire.span("Dedupe batch and skip already-stored (url, product)"):
+        # One review page can have multiple rows — one per applied product
+        # tag.  Idempotency key is therefore (url, product), not url alone.
+        # In-batch dedupe first, then skip pairs already in the DB (retried
+        # POSTs after a committed insert must not multiply rows).
+        # Skip is insert-only: existing pairs are not upserted.
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict] = []
+        for row in rows:
+            key = (row["url"], row["product"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        in_batch_dupes = len(rows) - len(deduped)
+        # Full in-batch-deduped payload for S3 (insert path + all-skipped heal).
+        payload_rows = deduped
+        rows = deduped
+
+        skipped_existing = 0
+        if rows:
+            pairs = [(row["url"], row["product"]) for row in rows]
+            existing = (
+                await session.execute(
+                    select(Review.url, Review.product).where(
+                        tuple_(Review.url, Review.product).in_(pairs)
+                    )
+                )
+            ).all()
+            existing_pairs = {(u, p) for u, p in existing}
+            if existing_pairs:
+                before = len(rows)
+                rows = [
+                    row
+                    for row in rows
+                    if (row["url"], row["product"]) not in existing_pairs
+                ]
+                skipped_existing = before - len(rows)
+
+        skipped_total = in_batch_dupes + skipped_existing
+        if skipped_total:
+            logfire.info(
+                "skipped {n} rows "
+                "(in_batch_dupes={ib}, already_stored={ex}; {kept} new)",
+                n=skipped_total,
+                ib=in_batch_dupes,
+                ex=skipped_existing,
+                kept=len(rows),
+            )
+        if not rows:
+            with logfire.span("Backup already-stored batch to S3"):
+                # Heal OBS after commit-then-backup-fail: parser retries see
+                # every pair as existing; merge payload and surface 503 if
+                # OBS is still down so retries continue.
+                try:
+                    await _backup_daily_batch(payload_rows, client)
+                except Exception as exc:
+                    logfire.warning(
+                        "S3 daily backup failed on all-skipped POST: {exc}",
+                        exc=str(exc),
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="S3 backup failed; reviews already in DB",
+                    ) from exc
+            return {"inserted": 0, "skipped": skipped_total}
+
     with logfire.span("Bulk insert and commit"):
         await session.execute(insert(Review), rows)
         await session.commit()
+        inserted = len(rows)
 
     with logfire.span("Embed new reviews"):
         try:
-            # We need the IDs of the just-inserted rows. Since we used bulk
-            # insert without RETURNING, query them back by matching the URLs
-            # (which are unique per review page).
-            # LEFT JOIN + IS NULL excludes reviews that already have
-            # embeddings (e.g. duplicate URLs that existed before this batch).
-            urls = [r.url for r in reviews]
+            # Match the just-inserted (url, product) pairs.  Multiple rows
+            # may share a URL (different product tags); do not key on URL alone.
+            # LEFT JOIN + IS NULL excludes reviews that already have embeddings.
+            pairs = [(row["url"], row["product"]) for row in rows]
             id_stmt = (
                 select(
                     Review.id,
@@ -184,7 +306,10 @@ async def post_reviews(
                     Review.reviewBody,
                 )
                 .outerjoin(ReviewEmbedding, ReviewEmbedding.review_id == Review.id)
-                .where(Review.url.in_(urls), ReviewEmbedding.review_id.is_(None))
+                .where(
+                    tuple_(Review.url, Review.product).in_(pairs),
+                    ReviewEmbedding.review_id.is_(None),
+                )
             )
             id_result = await session.execute(id_stmt)
             id_rows = id_result.all()
@@ -219,8 +344,23 @@ async def post_reviews(
             )
 
     with logfire.span("Backup daily batch to S3"):
-        await _backup_daily_batch(rows, client)
+        # Merge the full payload (new + already-stored in this request) so
+        # overlapping backfills heal OBS for skipped pairs too. Reviews are
+        # already committed: on PutObject failure return 503 so the parser
+        # retries (idempotent insert + all-skipped heal), not 201.
+        try:
+            await _backup_daily_batch(payload_rows, client)
+        except Exception as exc:
+            logfire.warning(
+                "S3 daily backup failed after commit (reviews kept): {exc}",
+                exc=str(exc),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="S3 backup failed; reviews already in DB",
+            ) from exc
 
+    return {"inserted": inserted, "skipped": skipped_total}
 
 # ── GET /reviews ─────────────────────────────────────────────────────────────
 # The main query endpoint. Called by the UI to fetch filtered reviews.

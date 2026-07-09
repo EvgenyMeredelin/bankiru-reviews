@@ -13,7 +13,10 @@ The run_once() function is the public entry point. It:
 
 The POST step includes resilience features:
   - Polls the API healthcheck before attempting the POST (handles API restarts)
-  - Retries the POST indefinitely with exponential backoff (never loses data)
+  - Retries the POST with exponential backoff, capped at ``_POST_MAX_ATTEMPTS``
+    (a permanent 5xx must not loop forever). The API is idempotent on
+    (url, product), so a retried POST after a successful commit does not
+    multiply rows.
 
 Connection to other modules:
   - bankiru.parser.__main__  — calls run_once() from the APScheduler cron job
@@ -130,17 +133,24 @@ async def _wait_for_api(http: httpx.AsyncClient, endpoint: str) -> None:
     )
 
 
+# Cap POST retries so a persistent API failure cannot block the next daily
+# crawl for hours. Insert idempotency is (url, product) on the API; all-skipped
+# retries still re-merge the payload into S3 to heal a prior backup miss.
+_POST_MAX_ATTEMPTS = 20
+_POST_MAX_DELAY_S = 60
+
+
 async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> None:
-    """POST the batch to the API with unlimited retries.
+    """POST the batch to the API with bounded retries.
 
     Before the first POST attempt the function polls ``GET /healthz`` to
     wait for the API to be ready (handles the case where the API container
     restarted during the crawl).
 
-    After spending hours crawling, losing the batch to a transient API outage
-    would be wasteful.  The retry loop mirrors the crawl client's philosophy:
-    keep trying with exponential back-off (capped at 60 s) until the POST
-    succeeds.
+    Retries transient 5xx / network errors with exponential back-off
+    (capped at ``_POST_MAX_DELAY_S``), up to ``_POST_MAX_ATTEMPTS``.  After
+    that the error is re-raised so the operator / Logfire sees the failure
+    instead of looping forever.
 
     Args:
         endpoint: Full URL for POST /reviews (e.g. "http://api:1706/reviews")
@@ -156,11 +166,9 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
         # Wait for the API to be healthy before attempting the POST.
         await _wait_for_api(http, endpoint)
 
-        # Unlimited retry loop with exponential backoff (capped at 60s).
-        # After spending hours crawling, we never give up on delivering
-        # the batch — the data is too valuable to lose.
         attempt = 0
-        while True:
+        last_exc: BaseException | None = None
+        while attempt < _POST_MAX_ATTEMPTS:
             attempt += 1
             try:
                 response = await http.post(endpoint, headers=headers, json=reviews)
@@ -174,6 +182,7 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
                 # succeed on retry — fail fast so the operator sees the problem.
                 # Transient server errors (5xx) and rate limits fall through to
                 # the backoff loop below.
+                last_exc = exc
                 if exc.response.status_code in {401, 403, 404, 422}:
                     logfire.error(
                         "POST {endpoint} failed with {status}: not retrying",
@@ -181,17 +190,27 @@ async def _post_with_retry(endpoint: str, reviews: list[dict], token: str) -> No
                         status=exc.response.status_code,
                     )
                     raise
-                delay = min(60, 2**attempt)
+                delay = min(_POST_MAX_DELAY_S, 2**attempt)
                 logfire.warning(
-                    "POST attempt={n} failed: {exc} (retry in {delay}s)",
-                    n=attempt, exc=repr(exc), delay=delay,
+                    "POST attempt={n}/{max} failed: {exc} (retry in {delay}s)",
+                    n=attempt, max=_POST_MAX_ATTEMPTS, exc=repr(exc), delay=delay,
                 )
                 await asyncio.sleep(delay)
             except httpx.HTTPError as exc:
+                last_exc = exc
                 # Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60, ...
-                delay = min(60, 2**attempt)
+                delay = min(_POST_MAX_DELAY_S, 2**attempt)
                 logfire.warning(
-                    "POST attempt={n} failed: {exc} (retry in {delay}s)",
-                    n=attempt, exc=repr(exc), delay=delay,
+                    "POST attempt={n}/{max} failed: {exc} (retry in {delay}s)",
+                    n=attempt, max=_POST_MAX_ATTEMPTS, exc=repr(exc), delay=delay,
                 )
                 await asyncio.sleep(delay)
+
+        logfire.error(
+            "POST {endpoint} gave up after {n} attempts: {exc}",
+            endpoint=endpoint,
+            n=_POST_MAX_ATTEMPTS,
+            exc=repr(last_exc),
+        )
+        assert last_exc is not None
+        raise last_exc

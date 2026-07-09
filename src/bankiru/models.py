@@ -40,8 +40,11 @@ class Base(DeclarativeBase):
 #     filter dropdowns in the Gradio UI (exact match / prefix match).
 #   - reviewBody is intentionally NOT indexed — full-text search is handled
 #     by the pgvector semantic search path (ReviewEmbedding + HNSW index).
-#   - Deduplication uses md5(reviewBody) + product at insert time, not a
-#     unique constraint, to avoid index bloat on the large text column.
+#   - There is intentionally no UNIQUE on url: the same review page is stored
+#     once per applied product tag, so identity of a row is (url, product).
+#     POST /reviews skips already-stored (url, product) pairs. Cleanup of
+#     near-duplicate bodies uses DELETE /reviews/duplicates (md5(reviewBody)
+#     + product), not a unique constraint on the large text column.
 class Review(Base):
     __tablename__ = "reviews"
 
@@ -57,8 +60,9 @@ class Review(Base):
     # Bank name from the JSON-LD `itemReviewed.name` field. Indexed for the
     # bank filter dropdown in the UI (exact match via IN clause).
     bankName: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-    # Canonical URL of the review's detail page on banki.ru. Used for
-    # deduplication (in-memory by the crawler) and for XLSX row colouring.
+    # Canonical URL of the review's detail page on banki.ru. The same URL may
+    # appear in multiple rows (different product tags). Used for XLSX row
+    # colouring and as half of the (url, product) insert idempotency key.
     url: Mapped[str] = mapped_column(Text, nullable=False)
     # Author's city, extracted from the detail page. Indexed for the location
     # filter (prefix match via startswith). Empty string if unavailable.

@@ -55,10 +55,10 @@ def get_engine() -> AsyncEngine:
       - connect_timeout=10: fail fast if the DB host is unreachable, rather
         than hanging the container's healthcheck indefinitely.
       - statement_timeout=300s: a safety net so no single query can block
-        the event loop forever. 300 s is generous enough for the heaviest
-        operation (full-table SELECT for Parquet backup of ~380K rows) while
-        still catching genuinely runaway queries. Individual routes can
-        override this per-transaction with SET LOCAL.
+        the event loop forever. 300 s covers heavy GET /reviews exports and
+        DELETE /reviews/duplicates; daily S3 backup only merges the inserted
+        batch (not a full-table read). Individual routes can override this
+        per-transaction with SET LOCAL.
       - pool_pre_ping=True: test connections before handing them out, which
         transparently recovers from Postgres restarts or network blips
         without surfacing stale-connection errors to callers.
@@ -73,9 +73,8 @@ def get_engine() -> AsyncEngine:
         # quick error in the lifespan instead of hanging the healthcheck.
         # `options` sets a default per-statement timeout so no single query
         # can hang the API indefinitely (individual routes may override via
-        # SET LOCAL).  300 s is generous enough for full-table SELECTs
-        # (the backup path reads every row) while still catching runaway
-        # queries that would otherwise hang forever.
+        # SET LOCAL).  300 s covers heavy exports / duplicate deletes while
+        # still catching runaway queries that would otherwise hang forever.
         _engine = create_async_engine(
             get_settings().POSTGRES_URL,
             connect_args={

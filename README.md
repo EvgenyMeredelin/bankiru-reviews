@@ -130,7 +130,7 @@ flowchart TD
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. On startup: `create_all_tables()` (blocks while building a missing HNSW index), then a background embedding backfill. Every parser POST triggers a daily Parquet backup of the collected batch to S3 under `bankiru-reviews/`. |
+| `api` | Built from `./Dockerfile` (`python:3.13-slim`, uv) | FastAPI. Handles `POST /reviews` (insert + inline embeddings), `GET /reviews` (filter + export + summarize), `DELETE /reviews` (by ID), `DELETE /reviews/by-date` (by date range), `DELETE /reviews/duplicates`. On startup: `create_all_tables()` (blocks while building a missing HNSW index), then a background embedding backfill. Each POST merges rows into per-`datePublished` Parquet files under `bankiru-reviews/` (new inserts and all-skipped retries; multi-day batches split by review date). DELETE does not prune OBS. |
 | `parser` | Same image, `command: python -m bankiru.parser` | APScheduler cron job. Crawls banki.ru once daily, collects negative reviews for the previous `PARSER_DAYS` days, and POSTs the deduplicated batch to the `api`. |
 | `ui` | Same image, `command: python -m bankiru.ui` | FastAPI + Gradio. OIDC-gated via Authentik (Authlib). Calls the `api` over the compose network. Bound to `127.0.0.1:17060` on the host; public access goes through Nginx. |
 | External: Postgres | (managed elsewhere) | Sole persistent data store. Two tables: `bankiru.reviews` and `bankiru.review_embeddings`. Schema is bootstrapped at `api` startup via `create_all_tables()` (pgvector extension, ORM tables, B-tree indexes, HNSW index via `ensure_hnsw_index()` — idempotent when valid; building a missing HNSW index blocks readiness). |
@@ -153,7 +153,7 @@ Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 | `datePublished` | `DATETIME` | Publication timestamp extracted from banki.ru's JSON-LD structured data. Format: `YYYY-MM-DD HH:MM:SS`. |
 | `reviewBody` | `TEXT` | Cleaned review text. HTML tags stripped (double pass — banki.ru sometimes HTML-encodes tags inside the body), emojis replaced via the `emoji` library, leading/trailing whitespace removed. |
 | `bankName` | `TEXT` | Bank name from the `itemReviewed.name` field in JSON-LD. |
-| `url` | `TEXT` | Canonical URL of the review's detail page on banki.ru (e.g. `https://www.banki.ru/services/responses/bank/response/123456/`). |
+| `url` | `TEXT` | Canonical URL of the review's detail page on banki.ru. The same URL may appear in multiple rows (one per product tag); not unique. |
 | `location` | `TEXT` | Author's city, extracted from the detail page (`<span class="l3a372298">…</span>`). Empty string if the element is absent or the detail page is unreachable. |
 | `product` | `TEXT` | Human-readable banking product label (e.g. `Кредитная карта`, `Ипотека`). Mapped from the banki.ru product slug by `parser/settings.py`. |
 
@@ -167,7 +167,9 @@ Two tables in PostgreSQL schema `bankiru`: `reviews` and `review_embeddings`.
 | `ix_reviews_product` | `product` | Product filter in `GET /reviews`. |
 | `ix_reviews_location` | `location` | Location prefix filter in `GET /reviews`. |
 
-**Deduplication keys:** `(reviewBody, product)` — compared via `md5(reviewBody)` to keep the hash table small (32-byte strings vs full review bodies). Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. MD5 collisions on natural-language texts are negligible. The crawler deduplicates in-memory before POSTing. The `DELETE /reviews/duplicates` endpoint deduplicates the database table in place (keeps the row with the lowest `id`).
+**Storage model:** one row per applied product tag. The same review page URL may appear multiple times with different `product` values — there is intentionally **no UNIQUE on `url`**. Insert idempotency (retried `POST /reviews`) keys on `(url, product)`.
+
+**Cleanup deduplication:** `(reviewBody, product)` — compared via `md5(reviewBody)` to keep the hash table small (32-byte strings vs full review bodies). Postgres uses `HashAggregate` for the full-table scan — no dedicated index needed. MD5 collisions on natural-language texts are negligible. The crawler also deduplicates in-memory by `(reviewBody, product)` before POSTing. The `DELETE /reviews/duplicates` endpoint deduplicates the database table in place (keeps the row with the lowest `id`).
 
 <a id="embeddings-table-bankiru-review-embeddings"></a>
 ### Embeddings table: `bankiru.review_embeddings` · [↑](#toc)
@@ -216,7 +218,7 @@ No auth. Returns `{"status": "ok"}`. Used by Docker's `healthcheck`.
 ]
 ```
 
-Inserts all rows, commits, generates vector embeddings for the new reviews (inline, best-effort), then uploads the batch as a daily Parquet backup (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`) to S3. Returns `201 Created` with no body.
+Dedupes the request body and skips pairs already stored under `(url, product)` (one page may yield multiple rows — one per product tag; no UNIQUE on `url`). Skipped pairs are **not** updated (re-crawl does not refresh body/location/bank). Inserts the remainder, commits, generates vector embeddings for the new reviews (inline, best-effort), then **merges** the full request payload into per-`datePublished` Parquet backups on S3 (`bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`). Multi-day batches are split by review date. If PutObject fails after commit, the API returns **503** (reviews stay in Postgres); the parser retries — inserts are skipped and the all-skipped path re-merges into OBS. DELETE endpoints do not prune OBS. Returns `201 Created` with `{"inserted": N, "skipped": M}` (empty `[]` → `{"inserted": 0, "skipped": 0}`).
 
 An empty JSON array (`[]`) is accepted and also returns `201` without touching the database or S3. If embedding generation fails for a batch, the reviews are still saved; missing embeddings are backfilled on the next API restart (see [Semantic search](#semantic-search)).
 
@@ -320,7 +322,7 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 
 **Registration is automatic.** `schemas.py` discovers all `*Maker` classes via `inspect.getmembers(handlers)` and builds `available_output_formats = {cls.extension: cls}`. Adding a new format means writing a subclass — no other file needs to change.
 
-**Backup key:** `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet` (daily batch, uploaded on POST). Named export keys: `<uuid4>.<extension>`.
+**Backup key:** `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet` — one object per review `datePublished` date; newly inserted rows are merged on POST (multi-day batches split across dates). Named export keys: `<uuid4>.<extension>`.
 
 **XLSX specifics:** Rows are colour-coded by review URL (alternating mint/pink per distinct URL) to visually group rows that belong to the same review. `reviewBody` is excluded from auto-fit. The `datePublished` column format (`YYYY-MM-DD HH:mm:ss`) is stamped directly via openpyxl after writing, because StyleFrame's per-row style merge is unreliable for `date_time_format`.
 
@@ -337,7 +339,7 @@ Handlers live in `src/bankiru/api/handlers.py`. Each format is a class that subc
 2. Extract review candidates from the listing HTML using two regexes:
    - `REVIEW_CONTENT_PATTERN` — matches inlined JSON-LD `Review` objects (strips out the fields we don't need: author, rating, postal address).
    - `REVIEW_URL_PATTERN` — matches the href of each review's detail-page link.
-   Both iterators are zipped so content and URL stay aligned. If the match counts differ, a warning is logged and `zip()` may pair mismatched entries — a signal that banki.ru changed its HTML or a regex needs updating.
+   Both iterators are zipped so content and URL stay aligned. If the match counts differ, a warning is logged and **the page's pairs are dropped** (no zip of unequal lists); pagination continues (`any_matched=True`) so a bad page does not stop the product crawl — a signal that banki.ru changed its HTML or a regex needs updating.
 3. For each candidate in the date window `[start_date, end_date)`: parse the JSON-LD fragment; **malformed JSON is skipped** (logged, crawl continues). Fetch the detail page, extract the author's city from `<span class="l3a372298">…</span>` (`LOC_PATTERN`), and append the finished record. If the detail page fails, `location` is stored as `""` — the review is never dropped.
 4. Stop paginating when the oldest review on the page predates `start_date` (`hit_left_boundary = True`) or the page contains no review markup at all (past the last page). Crucially, the crawler does **not** stop when `candidates` is empty: a page full of today's reviews (all newer than `end_date`) still needs to be paginated through to reach the date window.
 5. After all products: deduplicate in-memory on `(reviewBody, product)` via pandas `drop_duplicates`.
@@ -449,11 +451,11 @@ Actual run time is 0.5–1.5 hours because many products have only 1–2 listing
 <a id="post-batch-delivery"></a>
 ### POST batch delivery · [↑](#toc)
 
-After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate bulk INSERT, inline embedding generation, and the daily Parquet backup the API uploads after every insert.
+After the crawl completes, `runner.py` POSTs the collected reviews to the API (`CREATE_REVIEWS_ENDPOINT`). This POST uses a **separate** httpx client with a flat 600 s timeout (not the crawl client's split timeouts) — long enough to accommodate bulk INSERT, inline embedding generation, and merging inserted rows into per-`datePublished` Parquet backups.
 
 Before the first POST attempt, the runner polls `GET /healthz` (up to 30 × 5 s) so a mid-crawl API restart does not fail the delivery immediately.
 
-The POST retries **indefinitely** with exponential back-off capped at 60 s for transient failures (network errors, 5xx). **Client errors do not retry:** `401`, `403`, `404`, and `422` fail fast so a bad token or malformed payload surfaces immediately instead of looping for hours.
+The POST retries with exponential back-off capped at 60 s, up to **20 attempts**, for transient failures (network errors, 5xx — including **503** when S3 backup fails after a successful DB commit). After that the error is raised so a permanent failure cannot block the next daily crawl. **Client errors do not retry:** `401`, `403`, `404`, and `422` fail fast so a bad token or malformed payload surfaces immediately. The API skips already-stored `(url, product)` pairs and re-merges the payload into OBS on all-skipped retries, so a retried POST after commit+backup-fail heals S3 without multiplying rows.
 
 <a id="other-implementation-details"></a>
 ### Other implementation details · [↑](#toc)
@@ -715,7 +717,7 @@ bankiru-reviews/
     │   └── __main__.py             # CLI: backfill | build-index [--force] | reindex [--confirm]
     ├── parser/
     │   ├── __main__.py             # APScheduler entry; SIGHUP live reschedule
-    │   ├── runner.py               # run_once(days=N); POST with unlimited retry
+    │   ├── runner.py               # run_once(days=N); POST with capped retry
     │   ├── crawler.py              # BankiruCrawler; product/page/detail loop
     │   ├── client.py               # BankiruClient; randomised pacing; unlimited ban retry
     │   ├── settings.py             # PRODUCTS dict; regexes; UA/Accept-Language pools
@@ -992,8 +994,8 @@ PY
 # Postgres backup (external DB)
 pg_dump "$POSTGRES_URL" --no-owner --no-acl | gzip > backup-$(date +%F).sql.gz
 
-# S3 backup is automatic — every POST /reviews uploads the daily batch
-# as bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet in the OBS bucket.
+# S3 backup is automatic — each successful insert merges into
+# per-datePublished Parquet files bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet.
 ```
 
 <a id="count-reviews-per-day-with-url-dedup"></a>
@@ -1005,6 +1007,9 @@ Query `bankiru.reviews` inside `bankiru-api` — no API call, no summarization, 
 - **Total** — row count that day.
 - **Unique** — `COUNT(DISTINCT url)` that day.
 - **Dup** — `Total − Unique` that day (extra rows sharing a `url` on that day).
+  Note: some shared URLs are **expected** (one row per product tag). A storm of
+  identical `(url, product)` retries shows up as a much larger Dup than the
+  usual multi-tag fan-out.
 - **TOTAL** — sums the daily columns. TOTAL **Unique** is the sum of daily `COUNT(DISTINCT url)` values (the same `url` on two days is counted twice). It is not range-level `COUNT(DISTINCT url)` across the whole period.
 - Every calendar day in `[START, END]` is printed; days with no reviews show `0`. The example below had reviews on all three days.
 
@@ -1251,9 +1256,9 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 Ежедневный cron (APScheduler, по умолчанию **00:05** `Europe/Moscow`) обходит **24 URL-слага** (**23** уникальных названия продуктов: 12 для физлиц и 11 для юрлиц; слаги `corporate` и `legal` ведут к одной услуге «Обслуживание юридических лиц»). За каждый запуск собираются отзывы за последние `PARSER_DAYS` календарных суток (по умолчанию **1** — «вчера») и одним пакетом отправляются в API.
 
-Перед POST парсер опрашивает `GET /healthz`. При сбоях сети и **5xx** повторяет отправку бесконечно с экспоненциальной паузой (до 60 с); при **401/403/404/422** сразу завершается с ошибкой.
+Перед POST парсер опрашивает `GET /healthz`. Таймаут POST — **600 с**. При сбоях сети и **5xx** (включая **503** при сбое S3-бэкапа после commit) повторяет отправку с экспоненциальной паузой (до 60 с), **не более 20 попыток**; при **401/403/404/422** сразу завершается с ошибкой. API идемпотентен по `(url, product)` — повторный POST после успешного commit не размножает строки; all-skipped повтор **снова мержит** payload в OBS.
 
-**Стратегия обхода banki.ru:** один HTTP-запрос за раз; перед каждым — случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Раздельные таймауты на соединение и чтение. Ошибки TCP-соединения (вероятный бан WAF) повторяются без лимита с нарастающей задержкой. HTTP/2 отключён — WAF banki.ru отбрасывает ALPN `h2`. Дедупликация в памяти и в БД — по паре `(reviewBody, product)` (в SQL через `md5(reviewBody)`).
+**Стратегия обхода banki.ru:** один HTTP-запрос за раз; перед каждым — случайная пауза `uniform(PARSER_SLEEP_MIN, PARSER_SLEEP_MAX)` (по умолчанию 10–20 с, ~4 запроса/мин). Раздельные таймауты на соединение и чтение. Ошибки TCP-соединения (вероятный бан WAF) повторяются без лимита с нарастающей задержкой. HTTP/2 отключён — WAF banki.ru отбрасывает ALPN `h2`. При расхождении числа content/URL на листинге пары страницы **отбрасываются** (без zip неравных списков), пагинация продолжается. Один и тот же отзыв хранится по одному ряду на каждый тег продукта (без UNIQUE на `url`). Дедуп вставки — `(url, product)`; очистка почти-дублей тел — `(reviewBody, product)` (в SQL через `md5(reviewBody)`).
 
 <a id="хранение"></a>
 ### Хранение · [↑](#toc)
@@ -1262,10 +1267,10 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 | Таблица | Назначение |
 |---------|------------|
-| `reviews` | Отзывы: дата, текст, банк, URL, город, продукт |
+| `reviews` | Отзывы: дата, текст, банк, URL, город, продукт. Одна страница → несколько строк (по тегу `product`); UNIQUE на `url` нет |
 | `review_embeddings` | Векторы pgvector (1024 измерения, BAAI/bge-m3), индекс HNSW |
 
-Схема создаётся при старте API (`create_all_tables()`); построение отсутствующего HNSW-индекса **блокирует** готовность API. Ежедневный бэкап пакета парсера — Parquet в OBS: `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet`.
+Схема создаётся при старте API (`create_all_tables()`); построение отсутствующего HNSW-индекса **блокирует** готовность API. Бэкап — Parquet в OBS по дате отзыва (`datePublished`): `bankiru-reviews/bankiru-reviews-YYYY-MM-DD.parquet` (сбой PutObject → **503**, отзывы уже в Postgres; парсер ретраит и мержит payload на all-skipped; многодневный пакет режется по датам). DELETE эндпоинты OBS не чистят.
 
 <a id="api-сервис-api-порт-по-умолчанию-1706"></a>
 ### API (сервис `api`, порт по умолчанию 1706) · [↑](#toc)
@@ -1274,7 +1279,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 |----------|----------------|------------|
 | `GET /healthz` | нет | Проверка живости (Docker healthcheck) |
 | `GET /` | нет | Редирект на `/docs` (Swagger) |
-| `POST /reviews` | заголовок `API-Token` | Приём пакета от парсера: INSERT, inline-эмбеддинги, бэкап в S3. Пустой массив `[]` — `201` без записи в БД |
+| `POST /reviews` | заголовок `API-Token` | Приём пакета: дедуп и пропуск уже сохранённых `(url, product)` (без upsert), INSERT, inline-эмбеддинги, мерж в Parquet по `datePublished` (в т.ч. all-skipped retry). Ответ всегда `{"inserted", "skipped"}` (в т.ч. `[]` → нули). |
 | `GET /reviews` | **нет (публичный)** | Фильтры, выгрузка (csv/json/parquet/xlsx), pre-signed URL, LLM-суммаризация |
 | `DELETE /reviews` | `API-Token` | Удаление по списку ID |
 | `DELETE /reviews/by-date` | `API-Token` | Удаление по диапазону дат (включительно) |
@@ -1391,7 +1396,7 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 ### Что делает система · [↑](#toc)
 
 - **Собирает** отзывы с оценками 1–2 звезды по 23 банковским продуктам (12 для физлиц, 11 для юрлиц) — ежедневно, по расписанию.
-- **Хранит** отзывы в PostgreSQL с полнотекстовыми метаданными: дата, банк, продукт, город, URL источника.
+- **Хранит** отзывы в PostgreSQL с метаданными (дата, банк, продукт, город, URL) и отдельной таблицей pgvector-эмбеддингов для семантического поиска.
 - **Выгружает** результаты в форматах CSV, JSON, Parquet и XLSX с загрузкой в S3-совместимое хранилище (Cloud.ru OBS) и выдачей pre-signed ссылки на скачивание.
 - **Суммаризирует** отзывы с помощью LLM (Cloud.ru Foundation Models, OpenAI-совместимый API) по схеме map-reduce — поддерживается любой объём данных.
 - **Ищет семантически** — встроенный векторный поиск на базе pgvector (BAAI/bge-m3, 1024 измерения, HNSW-индекс) позволяет находить отзывы по смыслу, а не только по ключевым словам.
@@ -1417,7 +1422,7 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 - **Семантический поиск** — текстовый запрос кодируется моделью BGE-M3 и сравнивается с векторами отзывов через HNSW-индекс pgvector.
 - **Четыре формата выгрузки** — CSV, JSON, Parquet, XLSX (с цветовой группировкой строк).
 - **LLM-суммаризация** — рекурсивный map-reduce, автоматический подбор размера чанков под контекстное окно модели.
-- **Автоматический бэкап** — каждый пакет парсера сохраняется как Parquet-файл в OBS.
+- **Автоматический бэкап** — вставленные строки мержатся в Parquet по дате отзыва (`datePublished`) в OBS.
 - **Безопасность** — секреты в tmpfs (Infisical), OIDC-аутентификация, HSTS, блокировка dotfile-запросов на Nginx.
 - **Наблюдаемость** — Logfire (OpenTelemetry): структурированные логи и трейсы для всех сервисов.
 - **Расширяемость** — новый формат выгрузки добавляется одним классом-наследником `*Maker`; регистрация автоматическая.

@@ -215,14 +215,18 @@ class BankiruCrawler:
         content_matches = list(REVIEW_CONTENT_PATTERN.finditer(page_text))
         url_matches = list(REVIEW_URL_PATTERN.finditer(page_text))
         if len(content_matches) != len(url_matches):
+            # Do not zip unequal lists — that would pair the wrong URL with a
+            # review body. Drop this page's pairs but keep any_matched=True so
+            # pagination does not treat the page as "past the last listing".
             logfire.warning(
-                "Listing page match count mismatch: {content} content vs {url} url",
+                "Listing page match count mismatch: {content} content vs "
+                "{url} url — dropping page pairs to avoid misaligned rows",
                 content=len(content_matches),
                 url=len(url_matches),
             )
-        match_pairs = zip(content_matches, url_matches)
+            return [], False, True
 
-        for content_match, url_match in match_pairs:
+        for content_match, url_match in zip(content_matches, url_matches):
             any_matched = True
             # Reconstruct the JSON-LD object from the regex capture groups.
             # The regex captures only the parts we need (datePublished,
