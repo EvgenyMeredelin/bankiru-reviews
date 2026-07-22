@@ -137,10 +137,11 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
     # It must be inside the Blocks context to participate in event wiring.
     download_url_box.render()
 
-    # Page title
+    # Page title — equal CSS margins on the pipe so spacing stays even next to the link
     gr.HTML(
         "<p style=\"text-align:left;\">"
-        "Banki.ru Claims and Negative Reviews&nbsp;|&nbsp;"
+        "Banki.ru Claims and Negative Reviews"
+        "<span style=\"margin:0 0.5em\">|</span>"
         "<a href=\"https://wiki.uva-advanced.ru/doc/magazin-prilozhenij-oblaka-uva-KPzADBCe27#h-bankiru-bankiru-reviews\" "
         "target=\"_blank\" rel=\"noopener noreferrer\">Docs</a></p>"
     )
