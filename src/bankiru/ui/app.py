@@ -267,7 +267,8 @@ def create_app() -> FastAPI:
         #   - hide the "Built with Gradio" footer
         #   - match summary panel bottom inset to horizontal block padding
         #   - square corners on dropdowns/textboxes/accordion if theme tokens miss inner chrome
-        #   - slightly larger button labels (Submit / Clear / Download)
+        #   - slightly larger labels on Submit / Clear / Download only
+        #     (scoped via .action-btn so DateTime picker chrome is untouched)
         css="""
 footer {visibility: hidden}
 #summary-panel.block.padded,
@@ -280,7 +281,7 @@ input, textarea, select, .wrap, .multiselect, .input-container {
 .accordion, .accordion > button, details, summary {
     border-radius: 0 !important;
 }
-button {
+.action-btn {
     font-size: 1.1rem !important;
 }
 """,

@@ -241,15 +241,22 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
             ]
 
             # Primary action button: triggers the API call.
-            submit = gr.Button(value="Submit", variant="primary")
+            submit = gr.Button(
+                value="Submit", variant="primary", elem_classes="action-btn"
+            )
             # Clear button: resets all inputs, the summary, and the download URL.
             gr.ClearButton(
                 components=inputs + [summary, download_url_box],
                 value="Clear",
+                elem_classes="action-btn",
             )
             # Download buttons: trigger client-side JavaScript (no server round-trip).
-            download_reviews_btn = gr.Button(value="Download reviews")
-            download_summary_btn = gr.Button(value="Download summary")
+            download_reviews_btn = gr.Button(
+                value="Download reviews", elem_classes="action-btn"
+            )
+            download_summary_btn = gr.Button(
+                value="Download summary", elem_classes="action-btn"
+            )
 
         # ── Right column: summary display ────────────────────────────
         with gr.Column(scale=7):
