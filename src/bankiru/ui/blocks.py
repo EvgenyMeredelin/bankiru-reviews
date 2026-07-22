@@ -140,7 +140,7 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
     # Page title
     gr.HTML(
         "<p style=\"text-align:left;\">"
-        "Banki.ru Claims and Negative Reviews | "
+        "Banki.ru Claims and Negative Reviews&nbsp;|&nbsp;"
         "<a href=\"https://wiki.uva-advanced.ru/doc/magazin-prilozhenij-oblaka-uva-KPzADBCe27#h-bankiru-bankiru-reviews\" "
         "target=\"_blank\" rel=\"noopener noreferrer\">Docs</a></p>"
     )
