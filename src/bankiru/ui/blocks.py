@@ -151,6 +151,8 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
             ".bankiru-heading { display: flex !important; align-items: center; "
             "gap: 12px; text-align: left; }"
             ".bankiru-sep { flex: 0 0 auto; opacity: 0.85; line-height: 1; }"
+            ".bankiru-heading a { color: #60a5fa; text-decoration: underline; }"
+            ".bankiru-heading a:hover { color: #93c5fd; }"
         ),
         js_on_load=None,
         apply_default_css=False,
