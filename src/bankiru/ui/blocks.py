@@ -137,14 +137,23 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
     # It must be inside the Blocks context to participate in event wiring.
     download_url_box.render()
 
-    # Page title — flex gap + 1px rule (not "|") so both sides match optically
+    # Page title — Gradio 6 scoped css_template (inline flex on <p> gets overridden)
     gr.HTML(
-        "<p style=\"display:flex;align-items:center;gap:0.5em;margin:0;text-align:left;\">"
-        "<span>Banki.ru Claims and Negative Reviews</span>"
-        "<span style=\"width:1px;height:1em;background:currentColor;opacity:0.75;flex:0 0 auto\" "
-        "aria-hidden=\"true\"></span>"
-        "<a href=\"https://wiki.uva-advanced.ru/doc/magazin-prilozhenij-oblaka-uva-KPzADBCe27#h-bankiru-bankiru-reviews\" "
-        "target=\"_blank\" rel=\"noopener noreferrer\">Docs</a></p>"
+        html_template=(
+            '<div class="bankiru-heading">'
+            "<span>Banki.ru Claims and Negative Reviews</span>"
+            '<span class="bankiru-sep" aria-hidden="true">|</span>'
+            '<a href="https://wiki.uva-advanced.ru/doc/magazin-prilozhenij-oblaka-uva-KPzADBCe27#h-bankiru-bankiru-reviews" '
+            'target="_blank" rel="noopener noreferrer">Docs</a>'
+            "</div>"
+        ),
+        css_template=(
+            ".bankiru-heading { display: flex !important; align-items: center; "
+            "gap: 12px; text-align: left; }"
+            ".bankiru-sep { flex: 0 0 auto; opacity: 0.85; line-height: 1; }"
+        ),
+        js_on_load=None,
+        apply_default_css=False,
     )
     with gr.Row(height=40):
         pass  # visual spacer between the title and the main controls
