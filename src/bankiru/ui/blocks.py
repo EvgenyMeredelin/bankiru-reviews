@@ -8,20 +8,21 @@ The UI provides:
   - Multi-select dropdowns for bank, product, and location
   - Free-text semantic search (keywords)
   - Output format selection (CSV, JSON, Parquet, XLSX)
-  - LLM model selection for summarization
+  - Optional LLM model selection for summarization (default: no summary)
   - Submit button that triggers the API call
   - Download buttons for the exported file and the summary
 
 Data flow:
   User fills filters → clicks Submit → get_reviews() calls GET /reviews on
-  the API → API exports to S3 + summarizes → returns (download_url, summary)
-  → UI displays the summary and enables the Download button.
+  the API → API exports to S3 and optionally summarizes (when a model is
+  selected) → returns (download_url, summary) → UI displays the summary
+  and enables the Download button.
 
 Connection to other modules:
   - bankiru.ui.app              — mounts this Blocks instance at /gradio
   - bankiru.ui.choices          — provides static dropdown choices
   - bankiru.ui.foundation_models — provides the LLM model dropdown choices
-  - bankiru.config              — provides GET_REVIEWS_URL and DEFAULT_CLOUD_MODEL
+  - bankiru.config              — provides GET_REVIEWS_URL
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ from bankiru.config import get_settings
 from bankiru.ui import choices
 from bankiru.ui.foundation_models import list_foundation_models
 
+# Sentinel dropdown value: skip LLM summarization (API summarize=false).
+NO_SUMMARY = "<no summary>"
+
 
 async def get_reviews(
     start_date: str | None,
@@ -43,7 +47,7 @@ async def get_reviews(
     location: list[str] | None,
     keywords: str | None,
     file_format: str,
-    cloud_model: str,
+    cloud_model: str | None,
 ):
     """Triggered by the Submit button. Calls the API and returns results.
 
@@ -62,15 +66,18 @@ async def get_reviews(
         location: List of selected city names
         keywords: Free-text semantic search query
         file_format: Export format (csv/json/parquet/xlsx)
-        cloud_model: LLM model name for summarization
+        cloud_model: LLM model name, or NO_SUMMARY / empty to skip summarization
 
     Returns:
         Tuple of (download_url, summary_markdown).
         On error, returns ("", error_message).
     """
     settings = get_settings()
+    # None/"" can appear if the dropdown is cleared mid-submit; treat as skip.
+    want_summary = bool(cloud_model) and cloud_model != NO_SUMMARY
     # Build the query parameters dict, filtering out empty/None values
     # so the API doesn't receive spurious empty filters.
+    # Keep boolean False (summarize=false) — do not use truthiness checks.
     raw_params: dict[str, object] = {
         "startDate": start_date,
         "endDate": end_date,
@@ -79,8 +86,10 @@ async def get_reviews(
         "location": location,
         "keywords": keywords,
         "outputFormat": file_format,
-        "cloudModel": cloud_model,
+        "summarize": want_summary,
     }
+    if want_summary:
+        raw_params["cloudModel"] = cloud_model
     params = {
         k: v
         for k, v in raw_params.items()
@@ -100,8 +109,8 @@ async def get_reviews(
                 logfire.warning("API call failed: {exc}", exc=str(exc))
                 return "", f"Error talking to the API: {exc}"
 
-    # Return the pre-signed download URL and the LLM summary.
-    return body.get("url") or "", body.get("comment") or "(no comment returned)"
+    # Empty comment is normal when summarize=false; do not show a placeholder.
+    return body.get("url") or "", body.get("comment") or ""
 
 
 # Module-scope component declarations: NOT auto-rendered (only declarations
@@ -215,12 +224,12 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
                 choices=choices.FILE_FORMATS,
                 value="parquet",
             )
-            # LLM model selection for summarization. The choices are
-            # fetched from the Cloud.ru Foundation Models catalog (cached).
+            # LLM model selection for summarization. Default skips the LLM;
+            # real models come from the Cloud.ru catalog (cached at UI start).
             cloud_model = gr.Dropdown(
                 label="Summary model",
-                choices=list_foundation_models(),
-                value=get_settings().DEFAULT_CLOUD_MODEL,
+                choices=[NO_SUMMARY, *list_foundation_models()],
+                value=NO_SUMMARY,
             )
 
             # Collect all input components into a list for event wiring.

@@ -123,8 +123,8 @@ flowchart TD
 
 1. Browser → Nginx (TLS) → `ui` service (`127.0.0.1:17060`).
 2. Gradio calls `GET /reviews` on the `api` service (internal compose network, no `API-Token`), always with an explicit `outputFormat` (default dropdown: `parquet`).
-3. `api` queries Postgres, uploads the export to S3, generates a pre-signed URL, and (internal default) runs the LLM summarizer — JSON body `{url, comment, …}` (`reviews` is null when exporting).
-4. UI renders the summary in the Markdown panel; the "Download reviews" button opens the pre-signed URL in a new browser tab — **the browser fetches the file directly from OBS**, no server round-trip. The "Download summary" button saves the summary as a local `.md` file (client-side Blob, no server round-trip).
+3. `api` queries Postgres, uploads the export to S3, generates a pre-signed URL, and runs the LLM summarizer only when the UI sends `summarize=true` (a real **Summary model** is selected) — JSON body `{url, comment, …}` (`reviews` is null when exporting).
+4. UI renders the summary in the Markdown panel (empty when `<no summary>`); the "Download reviews" button opens the pre-signed URL in a new browser tab — **the browser fetches the file directly from OBS**, no server round-trip. The "Download summary" button saves the summary as a local `.md` file (client-side Blob, no server round-trip).
 
 **Request path for an external API client:** Browser/script → Nginx (TLS) → `api` (`127.0.0.1:1706`) with `API-Token` (guest or admin). On the public gateway, omitting `outputFormat` returns reviews **inline** in `reviews`, and `summarize` defaults to **false**. Full guide: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
 
@@ -258,7 +258,7 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
 | `keywords` | `string` | Free-text semantic search (UI label: **Semantic search**). When provided, the query is embedded with the BGE-M3 **query** prefix, reviews are ranked by cosine similarity (HNSW via pgvector), optionally filtered by `SEMANTIC_SEARCH_MAX_DISTANCE`, and capped at `SEMANTIC_SEARCH_LIMIT` (default 200). Combinable with all other filters. |
 | `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | **If omitted:** return matching rows inline in `reviews` (`url`/`filename` null). **If set:** export to S3 and return a pre-signed `url` (`reviews` null). Breaking change vs older default-`parquet` behaviour. The Gradio UI always sends an explicit format. |
 | `summarize` | `bool` | If omitted: **`false`** on the public Nginx gateway, **`true`** for internal (UI) calls. Explicit `true`/`false` always wins. Response echoes the *effective* value. |
-| `cloudModel` | string | Summarization model when effective `summarize` is true. Default: `DEFAULT_CLOUD_MODEL`. UI label: **Summary model**. |
+| `cloudModel` | string | Summarization model when effective `summarize` is true. API default if omitted: `DEFAULT_CLOUD_MODEL`. UI **Summary model** defaults to `<no summary>` (`summarize=false`). |
 
 **Successful response** (export + summarize example):
 
@@ -650,12 +650,12 @@ The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application ins
 | Location | Multi-select dropdown | 88 Russian regional capitals. Uses `startswith` matching on the server side. |
 | Semantic search | Textbox (single line) | Free-text semantic search query (API param: `keywords`). Ranked by cosine similarity, capped at `SEMANTIC_SEARCH_LIMIT`. Only reviews with embeddings participate. |
 | Format | Single-select dropdown | `csv`, `json`, `parquet`, `xlsx`. Default: `parquet`. |
-| Summary model | Single-select dropdown | Populated from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. Choices are resolved **once at UI process start** — restart the `ui` container after provider catalog changes. |
+| Summary model | Single-select dropdown | Default: `<no summary>` (skips LLM; UI sends `summarize=false`). Other choices from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. Choices are resolved **once at UI process start** — restart the `ui` container after provider catalog changes. |
 | Submit | Button | Calls `GET /reviews`, populates the Summary panel and stores the signed URL. Shows a short toast ("Download your file"). |
 | Clear | Button | Resets all inputs, the summary, and the hidden URL state. |
 | Download reviews | Button | Client-side JS: opens the stored pre-signed URL in a new tab. No server round-trip. |
 | Download summary | Button | Client-side JS: saves the summary Markdown panel content as a `.md` file. Filename matches the reviews file (same stem, `.md` extension). No server round-trip. |
-| Summary panel | Markdown (in accordion) | Displays the LLM summary; includes a copy button. Header in the API response uses `**Summary model:**` plus the model name. |
+| Summary panel | Markdown (in accordion) | Displays the LLM summary when a model is selected; stays empty for `<no summary>`. Includes a copy button. Header in the API response uses `**Summary model:**` plus the model name. |
 
 **Session details:** Starlette `SessionMiddleware`, signed cookie `bankiru_session`, `same_site=lax`, `https_only=True`, 1-hour TTL. Session payload: `{sub, username, email, id_token}`.
 
@@ -824,7 +824,7 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | `PARSER_BAN_PAUSE_MAX` | `300.0` | Max back-off pause (seconds) during connect-error streaks. |
 | `OPENAI_API_KEY` | `None` | Required for LLM summarization and the model dropdown. |
 | `OPENAI_BASE_URL` | `https://foundation-models.api.cloud.ru/v1` | OpenAI-compatible base URL. Any OpenAI-compatible provider works. |
-| `DEFAULT_CLOUD_MODEL` | `anthropic/claude-sonnet-4.6` | Default summarization model (UI label: **Summary model**). |
+| `DEFAULT_CLOUD_MODEL` | `anthropic/claude-sonnet-4.6` | Fallback summarization model when `summarize=true` and `cloudModel` is omitted. The Gradio UI defaults to `<no summary>` instead. |
 | `OUTPUT_TOKENS_LIMIT` | `50000` | Per-call output token cap (clipped to `max_model_len // 4` for small-context models). |
 | `DEFAULT_MODEL_CONTEXT` | `200000` | Fallback context window when the Cloud.ru `/models` catalog is unreachable. |
 | `SUMMARIZER_MAP_CONCURRENCY` | `4` | Maximum concurrent LLM calls in the map pass. |
@@ -1362,7 +1362,7 @@ docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 <a id="суммаризация"></a>
 ### Суммаризация · [↑](#toc)
 
-Map-reduce через Cloud.ru Foundation Models (OpenAI-совместимый API). Модель задаётся параметром `cloudModel` или `DEFAULT_CLOUD_MODEL`; в UI — выпадающий список **Summary model**. В ответе API заголовок резюме: `**Summary model:** \`…\``. Ошибки провайдера возвращаются текстом в поле `comment`, а не HTTP 500.
+Map-reduce через Cloud.ru Foundation Models (OpenAI-совместимый API). Модель задаётся параметром `cloudModel` или `DEFAULT_CLOUD_MODEL`; в UI — выпадающий список **Summary model** (по умолчанию `<no summary>`, без LLM). В ответе API заголовок резюме: `**Summary model:** \`…\``. Ошибки провайдера возвращаются текстом в поле `comment`, а не HTTP 500.
 
 <a id="веб-интерфейс-сервис-ui"></a>
 ### Веб-интерфейс (сервис `ui`) · [↑](#toc)
@@ -1379,7 +1379,7 @@ Gradio + FastAPI + Authentik OIDC. На хосте слушает только `
 | Location | Multi-select | 88 региональных центров; на сервере — `startswith` |
 | **Semantic search** | Textbox (1 строка) | Параметр API: `keywords` |
 | Format | Dropdown | csv / json / parquet / xlsx |
-| Summary model | Dropdown | Каталог Cloud.ru; загружается **один раз при старте** контейнера |
+| Summary model | Dropdown | По умолчанию `<no summary>` (без LLM); иначе каталог Cloud.ru (загрузка **один раз при старте** контейнера) |
 | Submit | Button | Вызывает `GET /reviews`; toast «Download your file» |
 | Download reviews | Button | Pre-signed URL в OBS (без round-trip на сервер) |
 | Download summary | Button | Сохранение Markdown локально (Blob в браузере) |
