@@ -64,7 +64,7 @@ fi
 # The client secret can be passed via environment variable (for CI/automation)
 # or entered interactively. The `-rs` flags on `read` suppress echo so the
 # secret doesn't appear on screen.
-if [[ -z "${INFISICAL_CLIENT_SECRET:-}" ]]; then
+if [[ -z "${INFISICAL_TOKEN:-}" && -z "${INFISICAL_CLIENT_SECRET:-}" ]]; then
   echo -n "[auth] Enter Infisical client secret: "
   read -rs INFISICAL_CLIENT_SECRET
   echo
@@ -95,16 +95,22 @@ done
 # The `--silent --plain` flags suppress interactive output and return only
 # the raw JWT token, which is stored in INFISICAL_TOKEN for subsequent
 # `infisical export` calls.
-echo "[secrets] Authenticating with Infisical…"
-export INFISICAL_TOKEN
-INFISICAL_TOKEN=$(infisical login \
-  --method=universal-auth \
-  --client-id="$INFISICAL_CLIENT_ID" \
-  --client-secret="$INFISICAL_CLIENT_SECRET" \
-  --domain="$INFISICAL_API_URL" \
-  --silent --plain)
-# Suppress the "new version available" nag from the Infisical CLI.
-export INFISICAL_DISABLE_UPDATE_CHECK=true
+if [[ -n "${INFISICAL_TOKEN:-}" ]]; then
+  echo "[secrets] Using existing INFISICAL_TOKEN (skip login)"
+  export INFISICAL_TOKEN
+  export INFISICAL_DISABLE_UPDATE_CHECK=true
+else
+  echo "[secrets] Authenticating with Infisical…"
+  export INFISICAL_TOKEN
+  INFISICAL_TOKEN=$(infisical login \
+    --method=universal-auth \
+    --client-id="$INFISICAL_CLIENT_ID" \
+    --client-secret="$INFISICAL_CLIENT_SECRET" \
+    --domain="$INFISICAL_API_URL" \
+    --silent --plain)
+  # Suppress the "new version available" nag from the Infisical CLI.
+  export INFISICAL_DISABLE_UPDATE_CHECK=true
+fi
 
 # ── Prepare the secrets directory on tmpfs ──────────────────────────────────
 # Handle the edge case where a previous run (as root) left a directory that
