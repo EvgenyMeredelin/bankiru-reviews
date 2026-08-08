@@ -55,7 +55,8 @@ DBSession = Annotated[AsyncSession, Depends(get_async_session)]
 # request handler finishes (via the async generator in get_async_client).
 BotoClient = Annotated[AioBaseClient, Depends(get_async_client)]
 
-# Privileged write auth: missing header → FastAPI 422.
+# Privileged write auth: a missing or empty header is rejected by APIKeyHeader
+# itself with 401, before api_token runs; a present but wrong token gives 403.
 _api_token_header = APIKeyHeader(name="API-Token")
 
 # Gateway GET auth: missing header must not reject internal UI calls.
@@ -77,7 +78,8 @@ async def api_token(
     Used on write endpoints (POST /reviews, DELETE /reviews, etc.). Guest
     tokens from ``GUEST_API_TOKEN`` are never accepted here.
 
-    Missing header → 422 (APIKeyHeader). Wrong value → 403.
+    Missing or empty header → 401 (raised by APIKeyHeader before this runs).
+    Present but wrong value → 403.
     """
     if not _token_matches(token, get_settings().API_TOKEN):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)

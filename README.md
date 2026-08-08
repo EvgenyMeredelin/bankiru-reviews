@@ -50,6 +50,7 @@
   - [Other implementation details](#other-implementation-details)
 - [Summarization — map-reduce pipeline](#summarization--map-reduce-pipeline)
 - [Semantic search](#semantic-search)
+  - [Design note: LLM failure vs embedder failure](#design-note-llm-failure-vs-embedder-failure)
   - [Embedding pipeline](#embedding-pipeline)
   - [Embedder CLI](#embedder-cli)
   - [Pre-deploy checklist](#pre-deploy-checklist)
@@ -65,6 +66,7 @@
   - [Production (with Infisical)](#production-with-infisical)
   - [`start.sh` flags](#startsh-flags)
   - [Local development (without Docker)](#local-development-without-docker)
+  - [Tests](#tests)
 - [Day-2 operations](#day-2-operations)
   - [Count reviews per day (with url dedup)](#count-reviews-per-day-with-url-dedup)
   - [Export reviews to CSV on the host (no summarization)](#export-reviews-to-csv-on-the-host-no-summarization)
@@ -79,6 +81,7 @@
   - [Семантический поиск](#семантический-поиск)
   - [Эмбеддинги](#эмбеддинги)
   - [Суммаризация](#суммаризация)
+  - [Заметка: сбой LLM и сбой эмбеддера](#заметка-сбой-llm-и-сбой-эмбеддера)
   - [Веб-интерфейс (сервис `ui`)](#веб-интерфейс-сервис-ui)
   - [Безопасность UI](#безопасность-ui)
   - [Инфраструктура и секреты](#инфраструктура-и-секреты)
@@ -122,11 +125,11 @@ flowchart TD
 **Request path for a UI query:**
 
 1. Browser → Nginx (TLS) → `ui` service (`127.0.0.1:17060`).
-2. Gradio calls `GET /reviews` on the `api` service (internal compose network, no `API-Token`), always with an explicit `outputFormat` (default dropdown: `parquet`).
-3. `api` queries Postgres, uploads the export to S3, generates a pre-signed URL, and runs the LLM summarizer only when the UI sends `summarize=true` (a real **Summary model** is selected) — JSON body `{url, comment, …}` (`reviews` is null when exporting).
-4. UI renders the summary in the Markdown panel (empty when `<no summary>`); the "Download reviews" button opens the pre-signed URL in a new browser tab — **the browser fetches the file directly from OBS**, no server round-trip. The "Download summary" button saves the summary as a local `.md` file (client-side Blob, no server round-trip).
+2. Gradio calls `GET /reviews` on the `api` service (internal compose network, no `API-Token`). The Format dropdown defaults to `parquet`, and `summarize` is sent explicitly (`true` only when a real **Summary model** is selected). Clearing Format omits `outputFormat`, so the API answers inline.
+3. `api` queries Postgres, optionally runs the LLM when `summarize=true`, then either returns rows inline or uploads the export to S3 and returns a pre-signed URL — JSON body `{url, comment, …}` or `{reviews, comment, …}`. An omitted date bound always resolves to the matching bound of the stored data (omitted `startDate` = earliest `datePublished` in DB, omitted `endDate` = the latest one), whatever `summarize` is; the resolved range drives the SQL filter and is echoed back in the response. An inverted effective range returns **400**, and with `summarize=true` a span longer than three calendar months returns **400** before the main select/LLM.
+4. On success, UI renders the summary in the Markdown panel (empty when `<no summary>`) and may show an info toast **"Download your file"** only when an export URL is present. On API/network failure the UI raises a Gradio **error toast** with the API `detail` (not Summary text), clears the signed URL and Summary, and does not show the download info toast. "Download reviews" opens the pre-signed URL in a new tab (**browser → OBS**, no server round-trip). "Download summary" saves the Summary Markdown as a local `.md` (client-side Blob).
 
-**Request path for an external API client:** Browser/script → Nginx (TLS) → `api` (`127.0.0.1:1706`) with `API-Token` (guest or admin). On the public gateway, omitting `outputFormat` returns reviews **inline** in `reviews`, and `summarize` defaults to **false**. Full guide: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
+**Request path for an external API client:** Browser/script → Nginx (TLS) → `api` (`127.0.0.1:1706`) with `API-Token` (guest or admin). Omitting `outputFormat` returns reviews **inline** in `reviews`. Omitting `summarize` is always **`false`** (gateway, localhost, or UI). Omitting a date bound resolves it to the earliest / latest stored review date, which is also what the response echoes back — a breaking change, since those fields are no longer `null`. Unknown query params → **422**. An inverted effective range → **400** (previously an empty 200); `summarize=true` with an effective date span &gt; 3 calendar months → **400** with a fixed `detail` string (same for Nginx, localhost, and Gradio); a `keywords` query the embedding provider cannot embed → **503** (previously an empty 200). Full guide: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
 
 ---
 
@@ -250,15 +253,15 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `startDate` | `YYYYMMDD` or `YYYY-MM-DD` | Include reviews published on or after this date. Hyphens stripped automatically. |
-| `endDate` | `YYYYMMDD` or `YYYY-MM-DD` | Include reviews published on or before this date. |
+| `startDate` | `YYYYMMDD` or `YYYY-MM-DD` | Include reviews published on or after this date. Hyphens stripped automatically. If omitted: earliest `datePublished` in the table, for every value of `summarize`. |
+| `endDate` | `YYYYMMDD` or `YYYY-MM-DD` | Include reviews published on or before this date. If omitted: latest `datePublished` in the table, for every value of `summarize`. |
 | `bankName` | repeatable string | Include only these bank names. Multiple values: `?bankName=Сбербанк&bankName=ВТБ`. Exact match. |
 | `location` | repeatable string | Include only reviews whose `location` starts with one of the given prefixes. Useful for matching a city when the stored value includes district suffixes. |
 | `product` | repeatable string | Exact match on `product`. |
 | `keywords` | `string` | Free-text semantic search (UI label: **Semantic search**). When provided, the query is embedded with the BGE-M3 **query** prefix, reviews are ranked by cosine similarity (HNSW via pgvector), optionally filtered by `SEMANTIC_SEARCH_MAX_DISTANCE`, and capped at `SEMANTIC_SEARCH_LIMIT` (default 200). Combinable with all other filters. |
-| `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | **If omitted:** return matching rows inline in `reviews` (`url`/`filename` null). **If set:** export to S3 and return a pre-signed `url` (`reviews` null). Breaking change vs older default-`parquet` behaviour. The Gradio UI always sends an explicit format. |
-| `summarize` | `bool` | If omitted: **`false`** on the public Nginx gateway, **`true`** for internal (UI) calls. Explicit `true`/`false` always wins. Response echoes the *effective* value. |
-| `cloudModel` | string | Summarization model when effective `summarize` is true. API default if omitted: `DEFAULT_CLOUD_MODEL`. UI **Summary model** defaults to `<no summary>` (`summarize=false`). |
+| `outputFormat` | `csv` / `json` / `parquet` / `xlsx` | **If omitted:** return matching rows inline in `reviews` (`url`/`filename` null). **If set:** export to S3 and return a pre-signed `url` (`reviews` null). Breaking change vs older default-`parquet` behaviour. Gradio defaults to `parquet`; clearing the Format dropdown omits this parameter (inline). |
+| `summarize` | `bool` | If omitted: **`false`** for every caller (gateway, localhost, Gradio). When `true`, the effective date interval must be ≤ 3 calendar months or the API returns **400** (omitted dates still count — see `startDate` / `endDate`). |
+| `cloudModel` | string | Summarization model when `summarize` is true. API default if omitted: `DEFAULT_CLOUD_MODEL`. UI **Summary model** defaults to `<no summary>` (`summarize=false`). |
 
 **Successful response** (export + summarize example):
 
@@ -280,7 +283,33 @@ An empty JSON array (`[]`) is accepted and also returns `201` without touching t
 }
 ```
 
-When `outputFormat` is omitted, `reviews` is a list of review objects and `url`/`filename` are `null`. If no reviews match, `reviews`/`url`/`filename` are `null` and `comment` is a "no results" message (even when `summarize` is false). Public HTTPS details and curl/HTTPie examples: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
+When `outputFormat` is omitted, `reviews` is a list of review objects and `url`/`filename` are `null`. If no reviews match, `reviews`/`url`/`filename` are `null` and `comment` is a "no results" message (even when `summarize` is false). The echoed `startDate` / `endDate` hold the **effective** bounds and are never `null` when the table has data (breaking change). On an empty table an unresolved bound stays `null` (both omitted → both `null`; one given → that side is echoed, the other is `null`). Unknown query params → **422**.
+
+An inverted effective range returns **400** for every value of `summarize` — including `startDate` past the newest review with an omitted `endDate`, which used to yield an empty 200:
+
+```json
+{
+  "detail": "Empty date range: endDate is earlier than startDate (an omitted bound falls back to the earliest / latest review date stored in the database)."
+}
+```
+
+With `summarize=true`, an effective interval longer than three calendar months returns **400** before SQL select / LLM — including when `startDate` and/or `endDate` are omitted — with:
+
+```json
+{
+  "detail": "Summarization is only allowed for date ranges of at most three calendar months. Narrow startDate/endDate (an omitted bound falls back to the earliest / latest review date stored in the database), or set summarize=false."
+}
+```
+
+A `keywords` query the embedding provider cannot embed — unreachable, erroring, or answering with no vector — returns **503**, where it used to return an empty 200 with the provider's message in `comment`:
+
+```json
+{
+  "detail": "Semantic search is temporarily unavailable: the query could not be embedded. Retry later, or repeat the request without keywords."
+}
+```
+
+Public HTTPS details and curl/HTTPie examples: [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md).
 
 <a id="delete-reviews--delete-by-id"></a>
 ### `DELETE /reviews` — delete by ID · [↑](#toc)
@@ -496,7 +525,7 @@ The POST retries with exponential back-off capped at 60 s, up to **20 attempts**
 <a id="summarization--map-reduce-pipeline"></a>
 ## Summarization — map-reduce pipeline · [↑](#toc)
 
-The summarizer (`api/summarizer.py`) handles arbitrarily large filter results: it chunks the corpus to fit the model's context window and recursively reduces partial summaries until the result is a single coherent text. Users never see a "context size exceeded" error.
+The summarizer (`api/summarizer.py`) handles arbitrarily large *token* budgets: it chunks the corpus to fit the model's context window and recursively reduces partial summaries until the result is a single coherent text. Users never see a "context size exceeded" error. Separately, `GET /reviews` rejects `summarize=true` when the effective date span exceeds three calendar months (**400** before the LLM runs).
 
 ```mermaid
 flowchart TD
@@ -529,7 +558,7 @@ The `// 4` cap prevents a small-context model (e.g. 4 k tokens) with a large `OU
 
 **Model context discovery:** The Cloud.ru `/models` endpoint is queried on demand, results cached for 1 hour. If the endpoint is unreachable, `DEFAULT_MODEL_CONTEXT` is used as a fallback. The same cached data feeds the UI model dropdown.
 
-**Error handling:** `ModelHTTPError` and `UsageLimitExceeded` are caught and returned as strings, so the API always returns a valid response body.
+**Error handling:** `ModelHTTPError` and `UsageLimitExceeded` are caught and returned as strings in `comment` with HTTP **200** (reviews / export URL still accompany the body). That is intentional — see [Design note: LLM failure vs embedder failure](#design-note-llm-failure-vs-embedder-failure).
 
 ---
 
@@ -542,11 +571,20 @@ The **Semantic search** field in the UI enables semantic (vector) search over re
 2. **INNER JOIN**s `bankiru.reviews` with `bankiru.review_embeddings`, applies all scalar filters (date range, bank, product, location), ranks by cosine distance, and applies optional tuning (`SEMANTIC_SEARCH_EF_SEARCH`, `SEMANTIC_SEARCH_MAX_DISTANCE`).
 3. Returns the top `SEMANTIC_SEARCH_LIMIT` (default 200) most relevant reviews.
 
-**What gets embedded (passage side):** each stored vector encodes enriched review text — `{bankName} | {product} | {location}\n{reviewBody}` — with the BGE-M3 **passage** prefix. This helps queries about banks, products, or cities match even when those words appear only in metadata, not in the review body.
+**What gets embedded (passage side):** each stored vector encodes enriched review text — `{bankName} | {product} | {location}\n{reviewBody}` with the BGE-M3 **passage** prefix. An empty/whitespace `location` is omitted from the header (`{bankName} | {product}\n{reviewBody}`). This helps queries about banks, products, or cities match even when those words appear only in metadata, not in the review body.
 
-Reviews that have no embedding row yet are **excluded** from semantic search (they still appear when Semantic search is empty and are picked up once backfill completes). When embedding the query fails, the API returns a JSON body with an error message in `comment` instead of crashing.
+Reviews that have no embedding row yet are **excluded** from semantic search (they still appear when Semantic search is empty and are picked up once backfill completes). When embedding the query fails, the request ends in **503** with a fixed `detail`:
 
-When Semantic search is empty, the query path is unchanged — all matching reviews are returned without vector ranking. There is **no row limit** on this path; very broad filters on a large table can produce heavy exports and long LLM runs.
+> Semantic search is temporarily unavailable: the query could not be embedded. Retry later, or repeat the request without keywords.
+
+The provider's own message names an internal endpoint, so it stays in the Logfire log rather than the response body. This replaces the earlier fail-soft **200** whose `comment` explained the failure: an empty result set was indistinguishable from "nothing matches your query", so a client could record "no complaints on this topic" for a search that never ran. In the Gradio UI the same `detail` arrives as an **error toast**.
+
+<a id="design-note-llm-failure-vs-embedder-failure"></a>
+### Design note: LLM failure vs embedder failure · [↑](#toc)
+
+Why LLM errors stay HTTP **200** with text in `comment`, while a broken embedder is **503**: see [Заметка: сбой LLM и сбой эмбеддера](#заметка-сбой-llm-и-сбой-эмбеддера) (Russian half of this README).
+
+When Semantic search is empty (including whitespace-only `keywords`), the query path is unchanged — all matching reviews are returned without vector ranking. There is **no row limit** on this path; very broad filters on a large table can produce heavy exports and long LLM runs.
 
 **Query-time tuning** (via environment variables):
 
@@ -624,7 +662,7 @@ docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 
 The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application inside a FastAPI app. The FastAPI layer handles OIDC; the Gradio layer handles the review query form.
 
-**Layout:** three columns inside a full-height Blocks page — filters (left), format/model/actions (middle), summary (right). The summary lives in a **Summary** accordion with a fixed-height Markdown panel (490 px), a **copy** button, and a toast after Submit. Buttons, dropdowns, text inputs, and the Summary accordion use the Ocean theme with **zero corner radius** (rectangular); mount CSS enforces square corners on inner Gradio chrome if theme tokens miss a control. The Gradio footer is hidden via mount CSS.
+**Layout:** three columns inside a full-height Blocks page — filters (left), format/model/actions (middle), summary (right). The summary lives in a **Summary** accordion with a fixed-height Markdown panel (490 px) and a **copy** button. After a successful Submit with an export URL, an info toast prompts download; API failures surface as Gradio **error** toasts (same `detail` as the REST **400**/**422**/**503**), and no download prompt is shown. Buttons, dropdowns, text inputs, and the Summary accordion use the Ocean theme with **zero corner radius** (rectangular); mount CSS enforces square corners on inner Gradio chrome if theme tokens miss a control. The Gradio footer is hidden via mount CSS.
 
 **OIDC flow:**
 
@@ -644,18 +682,18 @@ The UI service (`python -m bankiru.ui`) mounts a Gradio `Blocks` application ins
 
 | Control | Type | Notes |
 |---------|------|-------|
-| Start / End | DateTime | Date range filter (no time component). |
+| Start / End | DateTime | Date range filter (no time component). Leaving a field empty means the earliest / latest review date in the database, whatever the Summary model selection is. |
 | Bank | Multi-select dropdown | 50 banks pre-loaded in `choices.py` (top-50 by complaint volume 2025). Default: `Сбербанк`. |
 | Product | Multi-select dropdown | 23 banking product labels in `choices.py` (one entry per distinct label; the parser crawls 24 URL slugs including both `corporate` and `legal` for "Обслуживание юридических лиц"). |
 | Location | Multi-select dropdown | 88 Russian regional capitals. Uses `startswith` matching on the server side. |
 | Semantic search | Textbox (single line) | Free-text semantic search query (API param: `keywords`). Ranked by cosine similarity, capped at `SEMANTIC_SEARCH_LIMIT`. Only reviews with embeddings participate. |
 | Format | Single-select dropdown | `csv`, `json`, `parquet`, `xlsx`. Default: `parquet`. |
-| Summary model | Single-select dropdown | Default: `<no summary>` (skips LLM; UI sends `summarize=false`). Other choices from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. Choices are resolved **once at UI process start** — restart the `ui` container after provider catalog changes. |
-| Submit | Button | Calls `GET /reviews`, populates the Summary panel and stores the signed URL. Shows a short toast ("Download your file"). |
+| Summary model | Single-select dropdown | Default: `<no summary>` (skips LLM; UI sends `summarize=false`). Other choices from Cloud.ru `/models` API (TTL-cached 1 h); falls back to a hardcoded list if the API is unreachable. Choices are resolved **once at UI process start** — restart the `ui` container after provider catalog changes. Empty Start/End resolve to the earliest / latest review date in the database and still count towards the API’s three-month summarize limit. |
+| Submit | Button | Calls `GET /reviews`. On success: fills Summary + signed URL; info toast **"Download your file"** only if an export URL is present. On API/network error: Gradio **error toast** with the API `detail` (e.g. the three-month summarize **400**); clears signed URL and Summary (no stale Download). |
 | Clear | Button | Resets all inputs, the summary, and the hidden URL state. |
 | Download reviews | Button | Client-side JS: opens the stored pre-signed URL in a new tab. No server round-trip. |
 | Download summary | Button | Client-side JS: saves the summary Markdown panel content as a `.md` file. Filename matches the reviews file (same stem, `.md` extension). No server round-trip. |
-| Summary panel | Markdown (in accordion) | Displays the LLM summary when a model is selected; stays empty for `<no summary>`. Includes a copy button. Header in the API response uses `**Summary model:**` plus the model name. |
+| Summary panel | Markdown (in accordion) | Displays the LLM summary when a model is selected; stays empty for `<no summary>`. Includes a copy button. Header in the API response uses `**Summary model:**` plus the model name. API validation/range errors appear as Gradio error toasts, not in this panel. |
 
 **Session details:** Starlette `SessionMiddleware`, signed cookie `bankiru_session`, `same_site=lax`, `https_only=True`, 1-hour TTL. Session payload: `{sub, username, email, id_token}`.
 
@@ -722,7 +760,25 @@ bankiru-reviews/
 ├── uv.lock                         # locked dependency tree
 ├── .env.example                    # canonical key list with all defaults shown
 ├── scripts/
-│   └── start.sh                    # Infisical bootstrap → docker compose up
+│   ├── start.sh                    # Infisical bootstrap → docker compose up
+│   └── check-public-api.sh         # live checks of GET /reviews (read-only)
+├── tests/                          # pytest suite; no Postgres / S3 (fakes via dependency_overrides)
+│   ├── conftest.py                 # env vars, FakeSession / FakeBotoClient / FakeReview, stubs, app factory
+│   ├── test_auth_gateway.py        # gateway header, guest / admin tokens, write routes
+│   ├── test_query_validation.py    # formats, booleans, repeated params, dates over HTTP
+│   ├── test_schemas.py             # ReviewsQuery validation: extra_forbidden, date formats
+│   ├── test_date_resolution.py     # omitted bound → min / max datePublished
+│   ├── test_date_bounds_sql.py     # resolved bounds reach SQL, inclusive on both ends
+│   ├── test_summarize_limit.py     # three-calendar-month limit and its detail text
+│   ├── test_inverted_range.py      # endDate before startDate → 400
+│   ├── test_empty_table.py         # no bounds to resolve → 200 "no results"
+│   ├── test_filters_sql.py         # each filter in SQL; standard vs semantic path
+│   ├── test_response_shape.py      # inline / export / no results / summary, and the echo
+│   ├── test_semantic_failure.py    # embedder down → 503, provider message stays in the log
+│   ├── test_export_failures.py     # S3 refusing an upload or a pre-signed URL → 500
+│   ├── test_ui_params.py           # which query params Submit actually sends
+│   ├── test_ui_errors.py           # gr.Error toasts, Download info toast, failure cleanup
+│   └── test_documented_messages.py # error texts and test names quoted in the docs stay in step
 └── src/bankiru/
     ├── __init__.py                 # __version__ = "0.1.0"
     ├── config.py                   # Pydantic Settings; all env vars in one place
@@ -935,6 +991,174 @@ asyncio.run(run_once(start_date='2026-05-17', end_date='2026-05-19'))
 
 > **Note:** `end_date` is *exclusive* (the crawl window is `[start_date, end_date)`).
 > To collect reviews published on May 17 and May 18, set `end_date` to May 19.
+
+<a id="tests"></a>
+### Tests · [↑](#toc)
+
+```bash
+uv sync --group dev
+uv run pytest
+```
+
+The suite needs neither Postgres nor S3: the session and S3 dependencies are
+replaced with fakes through `app.dependency_overrides`, and `tests/conftest.py`
+supplies the required environment variables (including an empty
+`OPENAI_API_KEY`, which keeps the UI import offline). The LLM and the embedder
+are always stubbed, through the `summarizer`, `embedder`, `broken_embedder` and
+`empty_embedder` fixtures — no test reaches either provider.
+
+**The public gateway in tests.** From the application's point of view a request
+through Nginx differs in exactly one way: the `X-Bankiru-Gateway: 1` header,
+which the proxy overwrites so a client cannot forge its absence. The tests set
+that header themselves (`conftest.gateway()`). Since this layer either passes a
+request through untouched or answers 403, the rest of the suite runs without it
+and only a representative few scenarios are repeated through the gateway. What
+only a real deployment can show — TLS, the proxy setting the header, an error
+body reaching the client unaltered — is checked by
+[`scripts/check-public-api.sh`](scripts/check-public-api.sh) against the running
+service.
+
+#### Layer 1 — authorization · `tests/test_auth_gateway.py`
+
+| Condition | Outcome | Test |
+|-----------|---------|------|
+| No gateway header, no token | 200 — the UI and anything on the compose network | `test_an_internal_caller_needs_no_token` |
+| No gateway header, nonsense token | 200 — the token is not looked at | `test_an_internal_caller_may_send_any_token` |
+| Gateway header set to `0`, `true`, `2`, or empty | 200 — only the exact value `1` engages the check | `test_only_the_exact_header_value_engages_the_check` |
+| Gateway + guest token (either entry of the list) or admin token | 200 | `test_accepted_tokens` |
+| Gateway, no token | 403 | `test_a_missing_token_is_refused` |
+| Gateway + empty, wrong, or shorter token | 403 — a length mismatch must not raise out of `compare_digest` | `test_refused_tokens` |
+| Gateway, no token | Neither query runs | `test_a_refused_caller_reads_no_data` |
+| Gateway, no token **and** an unknown parameter | 403 — authorization is decided first | `test_authorization_precedes_query_validation` |
+| Guest token on any of the four write routes | 403 — guests never write, gateway header or not, and no statement runs | `test_a_guest_cannot_post`, `test_a_guest_cannot_delete`, `test_a_guest_cannot_delete_by_date`, `test_a_guest_cannot_delete_duplicates`, `test_no_write_route_touches_the_database_unauthorized` |
+| Any write route with an absent or empty `API-Token` header | 401, not 403 — `APIKeyHeader` rejects before `api_token` runs | `test_an_absent_write_token_is_401_not_403` |
+| `GET /healthz` through the gateway, no token | 200 — Docker's healthcheck depends on it | `test_healthz_needs_no_token_through_the_gateway` |
+| `GET /` | Redirect to `/docs` | `test_the_root_redirects_to_the_docs` |
+
+#### Layer 2 — query validation · `tests/test_query_validation.py`, `tests/test_schemas.py`
+
+| Condition | Outcome | Test |
+|-----------|---------|------|
+| `outputFormat` = `csv`, `json`, `parquet`, `xlsx` | 200, `filename` ends with that extension | `test_each_format_is_accepted` |
+| The handler set discovered by introspection | Exactly those four | `test_every_handler_is_reachable_by_name` |
+| `outputFormat` = `pdf`, `CSV`, or empty | 422 | `test_other_formats_are_rejected` |
+| `summarize` = `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off` | 200, echoed as a boolean | `test_accepted_booleans` |
+| `summarize` = `maybe`, `2`, `-1` | 422 | `test_rejected_booleans` |
+| `summarize` omitted | `false` for every caller | `test_summarize_defaults_to_false` |
+| `bankName` / `product` / `location` given once | Echoed as a one-element list | `test_a_single_value_becomes_a_one_element_list` |
+| The same parameter repeated | Every value collected | `test_a_repeated_parameter_collects_every_value` |
+| A date as `2026-03-01`, `20260301`, or `2026-3-1` | All three mean 1 March 2026 | `test_both_date_spellings_reach_the_same_bound` |
+| A date as an empty string | Treated as omitted, then resolved | `test_an_empty_date_is_resolved_like_an_omitted_one`, `test_empty_string_means_no_bound` |
+| A `datetime` passed to the model | Truncated to a date | `test_datetime_input_is_normalized_to_date` |
+| `not-a-date`, `2026-13-45`, `01-03-2026`, `20260231`, `2026-03-01T12:00` | 422 | `test_malformed_dates_are_rejected`, `test_malformed_date_is_rejected` |
+| An unknown parameter | 422, `extra_forbidden`, naming the parameter | `test_an_unknown_parameter_names_itself`, `test_unknown_query_param_is_rejected` |
+| Several unknown parameters | All of them reported | `test_every_unknown_parameter_is_reported` |
+| An unknown parameter | No query reaches the database | `test_validation_precedes_any_database_work` |
+| `cloudModel` with `summarize=false` | Echoed, but nothing is summarized | `test_cloud_model_without_summarize_is_inert` |
+
+#### Layer 3 — date bounds · `tests/test_date_resolution.py`, `tests/test_date_bounds_sql.py`, `tests/test_inverted_range.py`, `tests/test_summarize_limit.py`, `tests/test_empty_table.py`
+
+| Condition | Outcome | Test |
+|-----------|---------|------|
+| `startDate` omitted | Earliest stored `datePublished`, whatever `summarize` is | `test_omitted_start_resolves_to_min` |
+| `endDate` omitted | Latest stored `datePublished` — never "today" | `test_omitted_end_resolves_to_max`, `test_bounds_do_not_depend_on_the_current_date` |
+| Both omitted | The full span of the stored data | `test_both_omitted_span_the_stored_data` |
+| Both given | The bounds query is skipped entirely | `test_no_bounds_query_when_both_dates_given` |
+| Other filters given | Bounds are still read over the whole table, so a narrow filter cannot dodge the limit | `test_bounds_query_ignores_the_other_filters` |
+| A guest through the gateway | The same bounds as an internal caller | `test_a_guest_through_the_gateway_gets_the_same_bounds` |
+| `min()` / `max()` return `date` rather than `datetime` | Accepted | `test_plain_date_bounds_are_accepted` |
+| Any resolved range | Inclusive in SQL: `00:00:00` to `23:59:59.999999` | `test_bounds_are_inclusive`, `test_single_day_range_covers_that_day` |
+| Dates omitted | The resolved bounds still reach the SQL filter | `test_resolved_bounds_are_applied_when_dates_are_omitted` |
+| `keywords` or `summarize=true` | The same bounds as the plain path | `test_semantic_search_filters_on_the_resolved_bounds`, `test_summarized_query_filters_on_the_same_bounds` |
+| Effective `endDate` before `startDate` | 400 with a fixed `detail`, main query skipped | `test_explicitly_inverted_dates`, `test_start_after_the_last_stored_review`, `test_end_before_the_first_stored_review`, `test_inverted_range_skips_the_main_query` |
+| Inverted **and** longer than three months with `summarize` | The inversion is reported | `test_inversion_is_reported_before_the_summarize_limit` |
+| `summarize=true`, effective span exactly three calendar months | 200 | `test_exactly_three_months_is_allowed` |
+| `summarize=true`, one day more | 400, before the main query | `test_one_day_over_three_months_is_rejected`, `test_rejection_precedes_the_main_query` |
+| Three months across a shorter month (30 Nov → 28 Feb) | `relativedelta` clamps, moving the boundary a day | `test_three_months_are_calendar_months_not_ninety_days` |
+| `summarize=false`, any span | 200 — the limit guards summarization only | `test_same_range_without_summarize_is_fine` |
+| `summarize=true`, no dates at all | 400 — the incident case | `test_omitted_dates_hit_the_limit` |
+| `summarize=true`, only `endDate` given over a wide table | 400 — the omitted start opens the interval to the earliest review | `test_omitted_start_over_a_wide_table_is_rejected` |
+| `summarize=true`, only `startDate` given, data ending within three months | 200 — the span ends at the newest review, however old that is | `test_omitted_end_within_three_months_is_allowed`, `test_omitted_end_over_stale_data_is_allowed` |
+| Empty table, dates omitted | 200 "no results", both echoed dates `null`, main query skipped | `test_empty_table_returns_no_results`, `test_empty_table_skips_the_main_query` |
+| Empty table, one bound given | The given bound is echoed back; the other stays `null` | `test_one_given_bound_still_resolves_against_nothing` |
+| Empty table, `summarize=true`, dates omitted | 200 — resolution finds no bounds, so the span check never runs | `test_empty_table_does_not_trip_the_summarize_limit` |
+| Empty table, both dates given | Bounds are not resolved; an ordinary "no results" with the dates echoed (a span &gt; 3 months with `summarize=true` is still **400**) | `test_explicit_dates_take_the_ordinary_no_results_path` |
+
+#### Layer 4 — filters and the query path · `tests/test_filters_sql.py`
+
+| Condition | Outcome | Test |
+|-----------|---------|------|
+| No filters | Only the two date comparisons in `WHERE` | `test_without_filters_only_the_dates_are_constrained` |
+| `bankName` / `product` | `IN (...)`, exact match | `test_exact_filters_compile_to_in` |
+| `location` | `LIKE 'value' \|\| '%'` — prefix match | `test_location_matches_by_prefix` |
+| Several locations | Combined with `OR` | `test_several_locations_are_combined_with_or` |
+| Dates and all three filters | All combined with `AND` | `test_all_filters_apply_together` |
+| No `keywords` | Ordered, and with no `LIMIT` — a broad filter can produce a huge export | `test_the_standard_path_is_ordered_and_unlimited` |
+| `keywords` empty or whitespace only | The standard path; the embedder is never called | `test_blank_keywords_take_the_standard_path` |
+| `keywords` with text | `JOIN review_embeddings`, ranked by cosine distance, capped by `SEMANTIC_SEARCH_LIMIT` | `test_the_semantic_path_joins_embeddings_and_ranks_by_distance`, `test_the_semantic_limit_comes_from_settings` |
+| `keywords` with text | `SET LOCAL hnsw.ef_search` is issued for the transaction | `test_the_semantic_path_raises_hnsw_recall` |
+| `keywords` plus scalar filters | Ranking does not widen the filters | `test_the_semantic_path_keeps_the_scalar_filters` |
+| `SEMANTIC_SEARCH_MAX_DISTANCE` set | The distance also appears as a ceiling in `WHERE` | `test_the_distance_ceiling_is_applied_when_configured` |
+| `SEMANTIC_SEARCH_MAX_DISTANCE` empty | Ranking only, no ceiling | `test_no_distance_ceiling_when_disabled` |
+| `SEMANTIC_SEARCH_EF_SEARCH` zero or negative | Clamped to 1 — the value is interpolated into SQL | `test_a_nonpositive_ef_search_is_clamped` |
+| `bankName` / `product` given as an empty string | A real filter for the empty string: matches nothing | `test_an_empty_exact_filter_matches_nothing` |
+| `location` given as an empty string | The opposite — an empty prefix matches everything | `test_an_empty_location_matches_everything` |
+| `keywords` with `summarize=true` | The LLM reads the ranked, capped rows rather than the whole interval | `test_a_summary_reads_the_ranked_result_set` |
+
+#### Layer 5 — the response · `tests/test_response_shape.py`, `tests/test_semantic_failure.py`, `tests/test_export_failures.py`
+
+| Condition | Outcome | Test |
+|-----------|---------|------|
+| No `outputFormat`, rows found | `reviews` inline; `url` / `filename` `null` | `test_inline_branch` |
+| An inline row | Exactly the seven documented fields, `datePublished` as `YYYY-MM-DD HH:MM:SS` | `test_inline_rows_carry_every_documented_field` |
+| `outputFormat` set, rows found | `url` + `filename`, `reviews` `null`, one upload to S3 | `test_export_branch`, `test_the_export_is_uploaded_with_a_body` |
+| No rows | `comment` is the "no results" message; `reviews`, `url`, `filename` all `null` | `test_no_results_branch` |
+| No rows with `outputFormat` | No link to a file that was never written | `test_no_results_with_an_output_format_has_no_url` |
+| No rows with `summarize=true` | The summarizer is not called | `test_no_results_never_calls_the_summarizer` |
+| `summarize=true` | `comment` opens with `**Summary model:**` and the model used | `test_the_summary_names_the_default_model`, `test_an_explicit_model_overrides_the_default` |
+| Duplicate review bodies | Deduplicated before the LLM sees them | `test_identical_bodies_are_summarized_once` |
+| `summarize=true` with `outputFormat` | Both the summary and the download URL | `test_a_summary_and_an_export_arrive_together` |
+| `summarize` false or omitted | `comment` is `null` | `test_no_summary_without_the_flag` |
+| Explicit dates | Echoed unchanged, whatever `summarize` is | `test_echo_repeats_explicit_dates_unchanged` |
+| Any filters | All echoed, so the response is self-describing | `test_every_filter_is_echoed_back` |
+| Any response | Exactly the thirteen documented fields | `test_the_response_holds_no_unexpected_fields` |
+| `keywords` the embedder cannot embed | 503 with a fixed `detail`; no rows are read | `test_embedder_failure_is_a_503`, `test_no_reviews_are_read_when_the_search_cannot_run` |
+| The provider answers successfully but with no vector | The same 503, not a 500 | `test_an_empty_provider_answer_is_the_same_503` |
+| The same, through the gateway | The same 503 — not to be read as an authorization failure | `test_the_same_503_arrives_through_the_gateway` |
+| The same | The provider's own message (naming an internal endpoint) is logged and kept out of the body | `test_the_provider_message_stays_out_of_the_response`, `test_the_provider_message_is_logged` |
+| `keywords` with a working embedder | 200; the query is embedded stripped, in `query` mode | `test_a_working_embedder_still_searches`, `test_the_query_is_stripped_before_embedding` |
+| S3 refuses the upload or the pre-signed URL | 500 — never a 2xx, and no filename to retry | `test_a_failed_export_is_never_a_success`, `test_a_failed_export_names_no_file` |
+| The same, with `summarize=true` | The summary is lost with the response rather than delivered alone | `test_a_lost_summary_is_not_delivered_alone` |
+| No `outputFormat` with S3 unavailable | 200 — the inline path never touches the bucket | `test_an_inline_query_never_touches_s3` |
+| Any export | The link keeps botocore's default lifetime, about an hour | `test_the_download_link_keeps_the_default_lifetime` |
+
+#### Layer 6 — the Gradio UI · `tests/test_ui_params.py`, `tests/test_ui_errors.py`
+
+| Condition | Outcome | Test |
+|-----------|---------|------|
+| Model dropdown at `<no summary>`, empty, or cleared | `summarize=false`, no `cloudModel` | `test_no_model_means_no_summarization` |
+| A model chosen | `summarize=true` plus `cloudModel` | `test_a_chosen_model_requests_a_summary` |
+| No summary wanted | `summarize=false` is still sent — the filter drops by value, not by truthiness | `test_summarize_false_is_sent_rather_than_dropped` |
+| Empty dates, lists, or keywords | Omitted from the request rather than sent empty | `test_empty_inputs_are_not_sent` |
+| Every input filled | All of them reach the API, lists as repeated parameters | `test_every_filled_input_reaches_the_api` |
+| A format chosen in the dropdown | Passed through unchanged | `test_each_format_is_passed_through` |
+| The Format dropdown cleared | No `outputFormat` is sent, so the answer comes back inline | `test_a_cleared_format_asks_for_an_inline_answer` |
+| Any Submit | Nothing beyond the known parameters, which would come back as a 422 | `test_no_unexpected_parameters_are_sent` |
+| API answers 400, 401, 403, or 503 | `gr.Error` toast carrying the API's `detail` verbatim; no info toast | `test_an_api_error_becomes_an_error_toast`, `test_a_failed_request_shows_no_download_prompt` |
+| API answers 422 | The `loc`/`msg` list is flattened into one line | `test_validation_errors_are_flattened` |
+| A non-JSON or empty error body | Falls back to the text, then to the status code | `test_non_json_body_falls_back_to_text`, `test_empty_body_falls_back_to_the_status_code` |
+| A JSON `detail` string | Returned verbatim | `test_string_detail_is_returned_verbatim` |
+| The API unreachable | `gr.Error` naming the network failure | `test_network_failure_becomes_an_error_toast` |
+| 200 with an export URL | The "Download your file" info toast | `test_download_toast_only_fires_with_a_url` |
+| 200 without a URL | No info toast — there is nothing to download | `test_no_toast_without_a_url` |
+| Any failed Submit | The `.failure` listener clears the stale URL and Summary | `test_failure_handler_clears_url_and_summary` |
+
+#### Documentation
+
+`tests/test_documented_messages.py` keeps the prose honest: every `detail`
+string quoted in this file and in `docs/bankiru-reviews-public-api.md` must
+match the constant in the code, and every test named in the tables above must
+exist in `tests/`.
 
 ---
 
@@ -1309,7 +1533,7 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 | `GET /healthz` | нет | Проверка доступности (Docker healthcheck) |
 | `GET /` | нет | Редирект на `/docs` (Swagger) |
 | `POST /reviews` | `API-Token` = `API_TOKEN` | Приём пакета: дедуп и пропуск уже сохранённых `(url, product)` (без upsert), INSERT, inline-эмбеддинги, мерж в Parquet по `datePublished` (в т.ч. all-skipped retry). Ответ всегда `{"inserted", "skipped"}` (в т.ч. `[]` → нули). |
-| `GET /reviews` | внутри сети — нет; через Nginx — гостевой или `API_TOKEN` | Фильтры; без `outputFormat` — inline `reviews`, с форматом — файл в S3; `summarize` по умолчанию false на шлюзе / true внутри. Публичный URL: `https://bankiru.uva-advanced.ru` (см. [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md)) |
+| `GET /reviews` | внутри сети — нет; через Nginx — гостевой или `API_TOKEN` | Фильтры; без `outputFormat` — inline `reviews`, с форматом — файл в S3; `summarize` по умолчанию **false** везде; неизвестные query → **422**; пустая граница дат = граница данных (`min` / `max` `datePublished`) при любом `summarize` — и для SQL, и для полей-эхо; перевёрнутый диапазон → **400**; при `summarize=true` эффективный интервал ≤ 3 календарных месяцев иначе **400** с фиксированным `detail`; недоступный провайдер эмбеддингов при заданном `keywords` → **503**. Gradio: error toast + очистка URL/Summary. Публичный URL: `https://bankiru.uva-advanced.ru` (см. [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md)) |
 | `DELETE /reviews` | только `API_TOKEN` | Удаление по списку ID |
 | `DELETE /reviews/by-date` | только `API_TOKEN` | Удаление по диапазону дат (включительно) |
 | `DELETE /reviews/duplicates` | только `API_TOKEN` | Дедупликация таблицы (остаётся строка с минимальным `id`) |
@@ -1321,13 +1545,13 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 
 В UI поле называется **Semantic search**; параметр API — `keywords`.
 
-При непустом запросе:
+При запросе с непустым (после `strip`) `keywords`:
 
 1. Текст запроса кодируется моделью **BAAI/bge-m3** с **query**-префиксом BGE-M3.
 2. Выполняется **INNER JOIN** `reviews` + `review_embeddings`, применяются все скалярные фильтры, ранжирование по косинусному расстоянию (pgvector HNSW).
 3. Возвращаются топ-`SEMANTIC_SEARCH_LIMIT` результатов (по умолчанию **200**).
 
-**Что попадает в вектор (passage):** обогащённый текст `{bankName} | {product} | {location}\n{reviewBody}` с **passage**-префиксом BGE-M3. Это помогает находить отзывы по банку, продукту или городу, даже если эти слова есть только в метаданных.
+**Что попадает в вектор (passage):** обогащённый текст `{bankName} | {product} | {location}\n{reviewBody}` с **passage**-префиксом BGE-M3; пустой/`whitespace` `location` из заголовка выкидывается (`{bankName} | {product}\n{reviewBody}`). Это помогает находить отзывы по банку, продукту или городу, даже если эти слова есть только в метаданных.
 
 | Переменная | По умолчанию | Назначение |
 |----------|--------------|------------|
@@ -1335,7 +1559,37 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 | `SEMANTIC_SEARCH_EF_SEARCH` | `100` | `hnsw.ef_search` на время запроса (выше — лучше recall) |
 | `SEMANTIC_SEARCH_MAX_DISTANCE` | `0.55` | Потолок косинусного расстояния; пусто/`none`/не задано — отключить |
 
-Отзывы **без** строки в `review_embeddings` в semantic-поиск **не попадают** (но видны при пустом Semantic search). Без Semantic search **лимита строк нет** — широкий фильтр на большой таблице может дать тяжёлую выгрузку и долгую суммаризацию. При ошибке эмбеддинга запроса API возвращает сообщение в поле `comment`, а не HTTP 500.
+Отзывы **без** строки в `review_embeddings` в semantic-поиск **не попадают** (но видны при пустом Semantic search). Без Semantic search **лимита строк нет** — широкий фильтр на большой таблице может дать тяжёлую выгрузку и долгую суммаризацию. При ошибке эмбеддинга запроса ответ — **503** с фиксированным `detail` (в UI — error toast), а не пустой **200** с пояснением в `comment`: пустой результат нельзя отличить от «ничего не найдено».
+
+<a id="заметка-сбой-llm-и-сбой-эмбеддера"></a>
+### Заметка: сбой LLM и сбой эмбеддера · [↑](#toc)
+
+**Агент:**
+
+> Ошибки LLM по-прежнему возвращаются текстом в comment с кодом 200 — вы решили это не менять, и оба документа описывают такое поведение верно, но асимметрия с эмбеддингами теперь заметна.
+>
+> **Как сейчас работает LLM.**
+> При summarize=true отзывы уже выбраны (а при экспорте — ещё и залиты в S3). Если провайдер падает, summarize_map_reduce не кидает исключение, а возвращает текст ошибки строкой. Маршрут кладёт её в comment и отвечает 200 — рядом остаются reviews или url/filename.
+>
+> **Чем это отличается от keywords.**
+> При сбое эмбеддера выборки нет вообще: раньше приходил пустой 200, неотличимый от «ничего не найдено». Вы тогда сказали: если файл/данные есть — gr.Info нормален; если данных нет, а ошибка реальная — нужен gr.Error. Отсюда и 503 для семантики.
+>
+> **Что я имел в виду под «решили не менять».**
+> По тому же критерию ошибка LLM обычно как раз «данные есть, сводки нет»: в UI всё ещё появляется Download, а текст про сбой модели — в Summary. Поэтому в этом коммите путь суммаризации не трогали — меняли только случай без данных.
+>
+> Если хотите симметрии (ошибка LLM → тоже 503 / gr.Error), это уже отдельное решение: при экспорте придётся либо не отдавать ссылку, либо отдавать 503 после успешной выгрузки.
+
+**Вы:**
+
+> Мне не кажется, что это асимметрия. Сырые данные без суммаризации при ее невозможности - разумный компромисс. В то время как винегрет из почти всегда нерелевантных данных не является разумным компромиссом при нерабочем эмбеддере: лучше ничего, чем всё подряд. Согласен?
+
+**Агент:**
+
+> Да, согласен — это не асимметрия, а разные ставки.
+>
+> При сбое LLM основной результат уже есть: отзывы выбраны по вашим фильтрам. Ответ «вот данные, сводки нет» — нормальный компромисс.
+>
+> При сбое эмбеддера семантический поиск не состоялся. Подсовывать обычную выборку (или пустой 200) — это уже другой запрос, часто с почти нерелевантным набором. Лучше явный отказ, чем «всё подряд под видом поиска по смыслу».
 
 <a id="эмбеддинги"></a>
 ### Эмбеддинги · [↑](#toc)
@@ -1362,7 +1616,7 @@ docker exec bankiru-api python -m bankiru.embedder reindex --confirm
 <a id="суммаризация"></a>
 ### Суммаризация · [↑](#toc)
 
-Map-reduce через Cloud.ru Foundation Models (OpenAI-совместимый API). Модель задаётся параметром `cloudModel` или `DEFAULT_CLOUD_MODEL`; в UI — выпадающий список **Summary model** (по умолчанию `<no summary>`, без LLM). В ответе API заголовок резюме: `**Summary model:** \`…\``. Ошибки провайдера возвращаются текстом в поле `comment`, а не HTTP 500.
+Map-reduce через Cloud.ru Foundation Models (OpenAI-совместимый API). Модель задаётся параметром `cloudModel` или `DEFAULT_CLOUD_MODEL`; в UI — выпадающий список **Summary model** (по умолчанию `<no summary>`, без LLM). В ответе API заголовок резюме — `**Summary model:**` плюс имя модели. При `summarize=true` эффективный интервал дат не длиннее **трёх календарных месяцев** (пустой `startDate` = самый ранний отзыв в БД, пустой `endDate` = самый поздний) — иначе **400** с `detail` про лимит (Nginx / localhost / Gradio одинаково; в UI — error toast). Пустая таблица при опущенных датах — **200** «no results»: границ нет, проверка длины не запускается. Ошибки провайдера LLM возвращаются текстом в `comment` с HTTP **200** (отзывы / ссылка на файл при этом остаются; порядок — select → summarize → upload) — намеренно, см. [Заметка: сбой LLM и сбой эмбеддера](#заметка-сбой-llm-и-сбой-эмбеддера).
 
 <a id="веб-интерфейс-сервис-ui"></a>
 ### Веб-интерфейс (сервис `ui`) · [↑](#toc)
@@ -1373,14 +1627,14 @@ Gradio + FastAPI + Authentik OIDC. На хосте слушает только `
 
 | Элемент UI | Тип | Примечание |
 |------------|-----|------------|
-| Start / End | DateTime | Диапазон дат |
+| Start / End | DateTime | Диапазон дат. Пустое поле = самый ранний / самый поздний отзыв в БД, независимо от выбора Summary model |
 | Bank | Multi-select | 50 банков; по умолчанию «Сбербанк» |
 | Product | Multi-select | 23 продукта |
 | Location | Multi-select | 88 региональных центров; на сервере — `startswith` |
 | **Semantic search** | Textbox (1 строка) | Параметр API: `keywords` |
 | Format | Dropdown | csv / json / parquet / xlsx |
-| Summary model | Dropdown | По умолчанию `<no summary>` (без LLM); иначе каталог Cloud.ru (загрузка **один раз при старте** контейнера) |
-| Submit | Button | Вызывает `GET /reviews`; toast «Download your file» |
+| Summary model | Dropdown | По умолчанию `<no summary>` (без LLM); иначе каталог Cloud.ru (загрузка **один раз при старте** контейнера). Пустые Start/End = самый ранний / самый поздний отзыв в БД и в этом виде участвуют в проверке «≤ 3 месяца» на API |
+| Submit | Button | `GET /reviews`. Успех: Summary + URL; info «Download your file» только если есть URL экспорта. Ошибка API/сети: Gradio **error toast** с `detail`; URL и Summary очищаются |
 | Download reviews | Button | Pre-signed URL в OBS (без round-trip на сервер) |
 | Download summary | Button | Сохранение Markdown локально (Blob в браузере) |
 
@@ -1427,7 +1681,7 @@ Docker Compose: один образ, три сервиса (`api`, `parser`, `ui
 - **Собирает** отзывы с оценками 1–2 звезды по 23 банковским продуктам (12 для физлиц, 11 для юрлиц) — ежедневно, по расписанию.
 - **Хранит** отзывы в PostgreSQL с метаданными (дата, банк, продукт, город, URL) и отдельной таблицей pgvector-эмбеддингов для семантического поиска.
 - **Выгружает** результаты в CSV, JSON, Parquet и XLSX (S3/OBS + pre-signed URL) либо отдаёт отзывы **inline** в JSON, если `outputFormat` не указан.
-- **Суммаризирует** отзывы с помощью LLM (Cloud.ru Foundation Models, OpenAI-совместимый API) по схеме map-reduce — поддерживается любой объём данных; на публичном шлюзе `summarize` по умолчанию выключен.
+- **Суммаризирует** отзывы с помощью LLM (Cloud.ru Foundation Models, OpenAI-совместимый API) по схеме map-reduce; `summarize` по умолчанию выключен везде; при `summarize=true` эффективный интервал не длиннее трёх календарных месяцев (пустая граница = граница данных: самый ранний / самый поздний отзыв в БД; иначе **400** с фиксированным `detail` — в Gradio как error toast).
 - **Ищет семантически** — встроенный векторный поиск на базе pgvector (BAAI/bge-m3, 1024 измерения, HNSW-индекс) позволяет находить отзывы по смыслу, а не только по ключевым словам.
 - **Защищает доступ** — веб-UI через Authentik (OIDC); публичный `GET /reviews` — гостевой или привилегированный `API-Token` (см. [`docs/bankiru-reviews-public-api.md`](docs/bankiru-reviews-public-api.md)).
 

@@ -50,8 +50,8 @@ available_output_formats = {
 # unknown formats at the validation layer.
 outputFormats = Literal[tuple(available_output_formats)]  # type: ignore[valid-type]
 
-# Type alias for date fields that accept string, date, or None.
-# Used by ReviewsQuery.startDate and ReviewsQuery.endDate.
+# Accepted *input* types for ReviewsQuery date fields (before validation).
+# After ``handle_dates``, ``startDate`` / ``endDate`` are ``date | None``.
 date_value = str | date | None
 
 
@@ -63,6 +63,9 @@ class Review(BaseModel):
 
     Fields correspond 1:1 to the columns of the Review ORM model (models.py).
     """
+
+    model_config = ConfigDict(extra="forbid")
+
     datePublished: str    # "YYYY-MM-DD HH:MM:SS" — validated and converted below
     reviewBody: str       # cleaned review text (HTML stripped, emoji removed)
     bankName: str         # bank name from banki.ru's JSON-LD structured data
@@ -85,7 +88,7 @@ class Review(BaseModel):
 class ReviewOut(BaseModel):
     """One review row in an inline GET /reviews response (no S3 export)."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
 
     id: int
     datePublished: str
@@ -111,23 +114,34 @@ class ReviewsQuery(BaseModel):
     are returned inline in ``Response.reviews`` (no S3 file). When set, results
     are exported and ``url`` is a pre-signed download link.
 
-    ``summarize`` is optional: ``None`` means "use context default" (false on
-    the public Nginx gateway, true for internal UI calls). The response echoes
-    the *effective* boolean after that resolution.
+    Unknown query parameters are rejected (``extra="forbid"`` → HTTP 422).
+    ``summarize`` defaults to ``false`` for every caller (public gateway,
+    localhost, Gradio).
+
+    An omitted date bound is always resolved against the stored data
+    (``routes._resolve_date_range``), whatever ``summarize`` is: omitted
+    ``startDate`` becomes the earliest ``datePublished`` in the database,
+    omitted ``endDate`` the latest one. The resolved bounds drive the SQL
+    filter, the three-month limit on summarization and the echoed fields
+    alike, so those can never disagree.
     """
-    startDate: date_value = None       # inclusive start of date range
-    endDate: date_value = None         # inclusive end of date range
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Stored as ``date | None`` after validation; ``date_value`` is accepted input.
+    startDate: date | None = None      # inclusive start of date range
+    endDate: date | None = None        # inclusive end of date range
     bankName: list[str] | None = None  # filter by bank name(s)
     location: list[str] | None = None  # filter by city prefix(es)
     product: list[str] | None = None   # filter by product label(s)
     keywords: str | None = None        # free-text semantic search query
     outputFormat: outputFormats | None = None  # type: ignore[assignment]
-    summarize: bool | None = None      # None → gateway false / internal true
-    cloudModel: str | None = None      # LLM model when summarize is effective true
+    summarize: bool = False            # omit → false on every path
+    cloudModel: str | None = None      # LLM model when summarize is true
 
     @field_validator("startDate", "endDate", mode="before")
     @classmethod
-    def handle_dates(cls, value: date_value) -> date_value:
+    def handle_dates(cls, value: date_value) -> date | None:
         """Normalise date inputs: accept "YYYY-MM-DD", "YYYYMMDD", date objects, or None.
 
         The Gradio DateTime component sends dates as "YYYYMMDD" strings
@@ -137,26 +151,33 @@ class ReviewsQuery(BaseModel):
         if value is None or value == "":
             return None
         if isinstance(value, date):
-            return value
+            # ``datetime`` is a ``date`` subclass; normalise to a pure date.
+            return value.date() if isinstance(value, datetime) else value
         if isinstance(value, str):
             # Strip dashes to normalise "2025-06-01" → "20250601"
             value = value.replace("-", "")
             return datetime.strptime(value, "%Y%m%d").date()
-        return value
+        raise ValueError(f"Invalid date value: {value!r}")
 
 
 class Response(ReviewsQuery):
     """Response model for GET /reviews.
 
-    Extends ReviewsQuery (echo query parameters, with ``summarize`` resolved)
-    with either an S3 export or an inline review list:
+    Extends ReviewsQuery (echo query parameters, including ``summarize``) with
+    either an S3 export or an inline review list:
 
       - filename / url: set when ``outputFormat`` was provided
       - reviews: set when ``outputFormat`` was omitted
       - comment: LLM summary, no-results message, or null
+
+    The echoed ``startDate`` / ``endDate`` hold the *effective* bounds, so
+    they are never null even when the request omitted them. The one exception
+    is an empty table: nothing exists to resolve against, so the request
+    values are echoed unchanged.
     """
-    # Always the effective boolean (gateway/internal default already applied).
-    summarize: bool
+
+    model_config = ConfigDict(extra="forbid")
+
     filename: str | None = None
     url: str | None = None
     comment: str | None = None

@@ -63,6 +63,26 @@ dependencies = [
     "tzdata>=2024.2",
 ]
 
+# ── Development dependencies ────────────────────────────────────────────────
+# Not installed in the Docker images — only for running the test suite
+# locally (`uv sync --group dev && uv run pytest`).
+[dependency-groups]
+dev = [
+    # Test runner
+    "pytest>=8.3.0",
+    # Async test support — the API handlers are coroutines
+    "pytest-asyncio>=0.24.0",
+]
+
+# ── Test configuration ──────────────────────────────────────────────────────
+# asyncio_mode = "auto" lets async test functions run without a per-test
+# marker; pythonpath makes the src-layout package importable without an
+# editable install.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
 # ── Build system ────────────────────────────────────────────────────────────
 # Hatchling is a lightweight PEP 517 build backend. It reads the [project]
 # table above and produces wheels/sdists.

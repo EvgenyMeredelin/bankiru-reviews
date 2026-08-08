@@ -69,8 +69,14 @@ async def get_reviews(
         cloud_model: LLM model name, or NO_SUMMARY / empty to skip summarization
 
     Returns:
-        Tuple of (download_url, summary_markdown).
-        On error, returns ("", error_message).
+        Tuple of (download_url, summary_markdown). The ``Download your file``
+        info toast is shown on the way out, but only when the API returned an
+        export URL.
+
+    Raises:
+        gr.Error: API/network failure — Gradio error toast (not Summary text).
+            Raised before the info toast, and the ``.failure`` listener wired
+            to Submit then clears the stale URL and Summary.
     """
     settings = get_settings()
     # None/"" can appear if the dropdown is cleared mid-submit; treat as skip.
@@ -105,12 +111,59 @@ async def get_reviews(
                 response = await http.get(settings.GET_REVIEWS_URL, params=params)
                 response.raise_for_status()
                 body = response.json()
+            except httpx.HTTPStatusError as exc:
+                # Prefer FastAPI's ``detail`` so validation / range guards
+                # surface as written — not httpx's generic Client error URL dump.
+                detail = _api_error_detail(exc.response)
+                logfire.warning(
+                    "API call failed: {status} {detail}",
+                    status=exc.response.status_code,
+                    detail=detail,
+                )
+                raise gr.Error(detail) from None
             except httpx.HTTPError as exc:
                 logfire.warning("API call failed: {exc}", exc=str(exc))
-                return "", f"Error talking to the API: {exc}"
+                raise gr.Error(f"Error talking to the API: {exc}") from None
 
     # Empty comment is normal when summarize=false; do not show a placeholder.
-    return body.get("url") or "", body.get("comment") or ""
+    download_url = body.get("url") or ""
+    summary_md = body.get("comment") or ""
+    # Toast here (not .success) so it only fires after a real export URL and
+    # never races a chained listener against a stale component value.
+    if download_url:
+        gr.Info("Download your file", duration=5)
+    return download_url, summary_md
+
+
+def _clear_submit_outputs() -> tuple[str, str]:
+    """Clear signed URL + Summary after a failed Submit (stale success state)."""
+    return "", ""
+
+
+def _api_error_detail(response: httpx.Response) -> str:
+    """Extract a user-visible message from an API error response body."""
+    try:
+        payload = response.json()
+    except ValueError:
+        text = (response.text or "").strip()
+        return text or f"API error ({response.status_code})"
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    if isinstance(detail, list):
+        parts: list[str] = []
+        for item in detail:
+            if isinstance(item, dict):
+                loc = ".".join(str(x) for x in item.get("loc", ()) if x != "query")
+                msg = item.get("msg") or item.get("type") or str(item)
+                parts.append(f"{loc}: {msg}" if loc else str(msg))
+            else:
+                parts.append(str(item))
+        if parts:
+            return "; ".join(parts)
+    if detail is not None:
+        return str(detail)
+    return f"API error ({response.status_code})"
 
 
 # Module-scope component declarations: NOT auto-rendered (only declarations
@@ -267,13 +320,15 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
     # ── Event wiring ─────────────────────────────────────────────────
     # Submit button: call get_reviews() with all inputs, write results
     # to the hidden download_url_box and the visible summary component.
-    # On success, show a toast notification prompting the user to download.
+    # API errors raise gr.Error → Gradio error toast; .failure clears stale
+    # URL/Summary so Download reviews cannot open a previous export.
     submit.click(
         fn=get_reviews,
         inputs=inputs,
         outputs=[download_url_box, summary],
-    ).success(
-        lambda: gr.Info("Download your file", duration=5)
+    ).failure(
+        fn=_clear_submit_outputs,
+        outputs=[download_url_box, summary],
     )
 
     # Open the most recent pre-signed S3 URL in a new tab. No server hop —

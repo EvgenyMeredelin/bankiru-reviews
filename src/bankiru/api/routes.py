@@ -19,8 +19,14 @@ This module defines all HTTP endpoints for the API service:
 The GET /reviews endpoint is the most complex: it builds a dynamic SQLAlchemy
 query from the filter parameters, optionally performs semantic search via
 pgvector, then either returns reviews inline (no outputFormat) or exports to
-S3. LLM summarization runs only when the effective ``summarize`` flag is true
-(default false on the public gateway, true for internal UI calls).
+S3. LLM summarization runs only when ``summarize`` is true (default false for
+every caller). An omitted date bound always resolves to the matching bound of
+the stored data (omitted ``startDate`` = earliest ``datePublished``, omitted
+``endDate`` = the latest one), whatever ``summarize`` is. That one effective
+range drives the SQL filter, the echoed ``startDate`` / ``endDate`` and the
+three-calendar-month limit summarize enforces; an inverted range is a 400.
+A ``keywords`` query the embedding provider cannot embed is a 503 rather than
+an empty 200, which every client would read as "nothing matches".
 
 Connection to other modules:
   - bankiru.api.schemas    — Pydantic models for request/response validation
@@ -43,15 +49,14 @@ import logfire
 import pandas as pd
 from aiobotocore.client import AioBaseClient
 from botocore.exceptions import ClientError
+from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, insert, or_, select, text, tuple_
-from starlette.requests import Request as HttpRequest
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import RedirectResponse
 
 from bankiru.api import schemas
 from bankiru.api.deps import (
-    GATEWAY_HEADER,
-    GATEWAY_HEADER_VALUE,
     BotoClient,
     DBSession,
     api_token,
@@ -71,6 +76,37 @@ from bankiru.models import Review, ReviewEmbedding
 # All routes are registered on this router, which is included in the
 # FastAPI app by app.py's create_app() function.
 router = APIRouter()
+
+# Returned by GET /reviews whenever the filters select nothing. Kept as a
+# module constant because two branches emit it: the empty-table early exit
+# and the empty result set after the main query.
+NO_RESULTS_COMMENT = "Your search did not match any reviews"
+
+# An omitted bound falls back to the corresponding bound of the stored data,
+# so both error messages describe that rule the same way.
+_OMITTED_BOUND_HINT = (
+    "an omitted bound falls back to the earliest / latest review date "
+    "stored in the database"
+)
+
+INVERTED_RANGE_DETAIL = (
+    "Empty date range: endDate is earlier than startDate "
+    f"({_OMITTED_BOUND_HINT})."
+)
+
+SUMMARIZE_SPAN_DETAIL = (
+    "Summarization is only allowed for date ranges of at most three "
+    f"calendar months. Narrow startDate/endDate ({_OMITTED_BOUND_HINT}), "
+    "or set summarize=false."
+)
+
+# Raised when the embedding provider cannot embed the keywords query. The
+# provider's own message names an internal endpoint, so it stays in the log
+# and never reaches the client.
+SEMANTIC_UNAVAILABLE_DETAIL = (
+    "Semantic search is temporarily unavailable: the query could not be "
+    "embedded. Retry later, or repeat the request without keywords."
+)
 
 
 # ── Health check ─────────────────────────────────────────────────────────────
@@ -381,22 +417,46 @@ async def post_reviews(
     return {"inserted": inserted, "skipped": skipped_total}
 
 
-def _effective_summarize(r: ReviewsQuery, http_request: HttpRequest) -> bool:
-    """Resolve summarize: explicit query wins; else gateway→False, internal→True."""
-    if r.summarize is not None:
-        return r.summarize
-    is_gateway = (
-        http_request.headers.get(GATEWAY_HEADER) == GATEWAY_HEADER_VALUE
-    )
-    return not is_gateway
-
-
-def _response_base(r: ReviewsQuery, effective_summarize: bool) -> dict:
-    """Echo query fields with summarize set to the effective boolean."""
-    return {**r.model_dump(), "summarize": effective_summarize}
-
-
 # ── GET /reviews ─────────────────────────────────────────────────────────────
+def _as_date(value: date | datetime) -> date:
+    """Normalize a datePublished value (DateTime column) to a plain date."""
+    return value.date() if isinstance(value, datetime) else value
+
+
+async def _resolve_date_range(
+    r: ReviewsQuery, session: AsyncSession
+) -> tuple[date, date] | None:
+    """Resolve the effective date range: omitted bound → bound of the data.
+
+    An omitted ``startDate`` becomes the earliest ``datePublished`` in the
+    table and an omitted ``endDate`` becomes the latest one. The bounds are
+    read over the whole table, ignoring bankName/product/location/keywords:
+    otherwise the dates echoed back would drift with the filters and the
+    three-month summarization limit could be bypassed by a narrow filter.
+
+    Returns:
+        ``(start, end)``, or ``None`` when the table holds no reviews at all.
+    """
+    if r.startDate is not None and r.endDate is not None:
+        return r.startDate, r.endDate
+
+    # Only when a bound is missing, and then a single round-trip: PostgreSQL
+    # rewrites each of min()/max() into its own InitPlan (LIMIT 1 over the
+    # datePublished B-tree), so the cost does not grow with the table.
+    with logfire.span("Resolve date bounds"):
+        earliest, latest = (
+            await session.execute(
+                select(func.min(Review.datePublished), func.max(Review.datePublished))
+            )
+        ).one()
+    if earliest is None or latest is None:
+        return None
+
+    start = r.startDate if r.startDate is not None else _as_date(earliest)
+    end = r.endDate if r.endDate is not None else _as_date(latest)
+    return start, end
+
+
 # Main query endpoint. Internal UI calls need no token; requests proxied
 # through the public Nginx gateway must present a guest or admin API-Token.
 @router.get(
@@ -405,7 +465,6 @@ def _response_base(r: ReviewsQuery, effective_summarize: bool) -> dict:
     dependencies=[Depends(guest_or_admin_token_if_gateway)],
 )
 async def get_reviews(
-    http_request: HttpRequest,
     r: Annotated[ReviewsQuery, Query()],
     session: DBSession,
     client: BotoClient,
@@ -422,19 +481,53 @@ async def get_reviews(
       - location: list of city prefixes (startswith match)
       - keywords: free-text semantic search (pgvector cosine similarity)
       - outputFormat: if omitted, return reviews inline; if set, S3 export
-      - summarize: if omitted, false on gateway / true internally
-      - cloudModel: LLM model when summarize is effective true
+      - summarize: if omitted, false for every caller
+      - cloudModel: LLM model when summarize is true
+
+    Date semantics (the same for every caller and for both values of
+    ``summarize``): an omitted bound falls back to the corresponding bound of
+    the stored data — omitted ``startDate`` means the earliest
+    ``datePublished`` in the table, omitted ``endDate`` the latest one. Both
+    bounds are inclusive, drive the SQL filter, and are echoed back in the
+    response, so ``startDate``/``endDate`` are never null. The one exception
+    is an empty table: there is nothing to resolve against, so the request
+    values are echoed unchanged.
+
+    Errors: an inverted effective range (``endDate`` before ``startDate``)
+    → 400; with ``summarize`` true, an effective interval longer than three
+    calendar months → 400; unknown query params → 422; a ``keywords`` query
+    the embedding provider cannot embed → 503, because a 200 with an empty
+    result set would read as "nothing matches" to every client.
 
     Returns a Response with either ``reviews`` (inline) or ``url``/``filename``
     (export), plus optional ``comment`` (LLM summary or no-results message).
     """
-    effective_summarize = _effective_summarize(r, http_request)
+    # One effective range feeds the SQL filter, the three-month limit and the
+    # echoed fields, so all three can never disagree.
+    date_range = await _resolve_date_range(r, session)
+    if date_range is None:
+        # Empty table: no bounds exist, so skip the limit and the main query.
+        return Response(**r.model_dump(), comment=NO_RESULTS_COMMENT)
+    start_date, end_date = date_range
+
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=INVERTED_RANGE_DETAIL,
+        )
+
+    if r.summarize and end_date > start_date + relativedelta(months=3):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=SUMMARIZE_SPAN_DETAIL,
+        )
+
+    echo = {**r.model_dump(), "startDate": start_date, "endDate": end_date}
 
     with logfire.span("Select entries"):
         # Build a list of WHERE clauses from the query parameters.
-        # Only non-None parameters contribute a clause, so an empty query
-        # returns all reviews (no WHERE conditions).
-        clauses = []
+        # The date range is always present (resolved above); the remaining
+        # parameters contribute a clause only when set.
 
         # ── Date range filter ────────────────────────────────────────
         # Compare datePublished (a DateTime column) directly against
@@ -442,10 +535,10 @@ async def get_reviews(
         # previous `cast(datePublished, Date)` wrapped the column in a
         # function call, forcing a sequential scan.
         # time.min = 00:00:00, time.max = 23:59:59.999999
-        if r.startDate:
-            clauses.append(Review.datePublished >= datetime.combine(r.startDate, time.min))
-        if r.endDate:
-            clauses.append(Review.datePublished <= datetime.combine(r.endDate, time.max))
+        clauses = [
+            Review.datePublished >= datetime.combine(start_date, time.min),
+            Review.datePublished <= datetime.combine(end_date, time.max),
+        ]
         # ── Location filter (prefix match) ───────────────────────────
         # Uses startswith() for prefix matching (e.g. "Москва" matches
         # "Москва, район Хамовники"). OR across multiple locations.
@@ -473,17 +566,21 @@ async def get_reviews(
                         [r.keywords.strip()],
                         mode="query",
                     )
+                    # Indexed inside the try: a provider that answers with no
+                    # vector leaves the search just as impossible to run, and
+                    # must not surface as a 500.
+                    query_vector = query_vectors[0]
                 except Exception as exc:
                     logfire.warning(
                         "Failed to embed semantic search query: {exc}", exc=str(exc),
                     )
-                    # Fail gracefully: return an error message instead of
-                    # crashing. The user can retry without a semantic search query.
-                    return Response(
-                        **_response_base(r, effective_summarize),
-                        comment=f"Semantic search unavailable: {exc}",
-                    )
-                query_vector = query_vectors[0]
+                    # A 200 with an empty result set would read as "nothing
+                    # matches your query" to any client, so say plainly that
+                    # the search never ran.
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=SEMANTIC_UNAVAILABLE_DETAIL,
+                    ) from exc
 
             with logfire.span("Semantic search with filters"):
                 # Higher ef_search improves HNSW recall during approximate search.
@@ -522,13 +619,10 @@ async def get_reviews(
     # ── Inline or export; optional summarize ──────────────────────────
     with logfire.span("Handle reviews and return a response"):
         if not (scalars := result.scalars().all()):
-            return Response(
-                **_response_base(r, effective_summarize),
-                comment="Your search did not match any reviews",
-            )
+            return Response(**echo, comment=NO_RESULTS_COMMENT)
 
         comment: str | None = None
-        if effective_summarize:
+        if r.summarize:
             with logfire.span("Summarize reviews"):
                 model_name = r.cloudModel or get_settings().DEFAULT_CLOUD_MODEL
                 # Deduplicate bodies (same as ScalarsHandler.summarize_reviews).
@@ -539,7 +633,7 @@ async def get_reviews(
         if r.outputFormat is None:
             reviews = [ReviewOut.model_validate(row) for row in scalars]
             return Response(
-                **_response_base(r, effective_summarize),
+                **echo,
                 reviews=reviews,
                 comment=comment,
             )
@@ -549,7 +643,7 @@ async def get_reviews(
         await handler.upload_contents()
         url = await handler.generate_url()
         return Response(
-            **_response_base(r, effective_summarize),
+            **echo,
             filename=handler.key,
             url=url,
             comment=comment,

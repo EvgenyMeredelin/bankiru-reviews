@@ -25,7 +25,8 @@ __pycache__/
 # uv/pyenv Python version pin — the Dockerfile ARG controls the version
 .python-version
 
-# Test and linter caches — development-only artifacts
+# Test suite and linter caches — development-only, never run in the image
+tests/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
