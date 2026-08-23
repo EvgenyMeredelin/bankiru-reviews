@@ -765,6 +765,7 @@ bankiru-reviews/
 ├── tests/                          # pytest suite; no Postgres / S3 (fakes via dependency_overrides)
 │   ├── conftest.py                 # env vars, FakeSession / FakeBotoClient / FakeReview, stubs, app factory
 │   ├── test_auth_gateway.py        # gateway header, guest / admin tokens, write routes
+│   ├── test_guest_tokens.py        # GUEST_API_TOKEN owner:token parsing
 │   ├── test_query_validation.py    # formats, booleans, repeated params, dates over HTTP
 │   ├── test_schemas.py             # ReviewsQuery validation: extra_forbidden, date formats
 │   ├── test_date_resolution.py     # omitted bound → min / max datePublished
@@ -862,7 +863,7 @@ All configuration is environment-driven via Pydantic Settings (`src/bankiru/conf
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOGFIRE_TOKEN` | `None` | Logfire ingestion token. Omit for local dev (no-op). |
-| `GUEST_API_TOKEN` | `[]` (empty) | Comma-separated read-only tokens for `GET /reviews` via `https://bankiru.uva-advanced.ru`. Guests cannot `POST`/`DELETE`. Empty → only `API_TOKEN` accepted on the gateway GET path. |
+| `GUEST_API_TOKEN` | `[]` (empty) | Comma-separated `owner@example.org:token` pairs for `GET /reviews` via `https://bankiru.uva-advanced.ru`. The client sends only the token in `API-Token`. Guests cannot `POST`/`DELETE`. Empty → only `API_TOKEN` accepted on the gateway GET path. Tokens must not contain commas. |
 | `OBS_BACKUP_PREFIX` | `bankiru-reviews` | S3 key prefix (subfolder) for daily Parquet backups. Files are written as `{prefix}/bankiru-reviews-YYYY-MM-DD.parquet`. |
 | `API_PORT` | `1706` | API listen port (bound to `127.0.0.1` on the host). If changed, also update `CREATE_REVIEWS_ENDPOINT`, `GET_REVIEWS_URL`, and the Nginx upstream port in `config/bankiru-reviews.conf`. |
 | `UI_PORT` | `17060` | UI listen port (bound to `127.0.0.1` on the host). |
@@ -1018,14 +1019,15 @@ body reaching the client unaltered — is checked by
 [`scripts/check-public-api.sh`](scripts/check-public-api.sh) against the running
 service.
 
-#### Layer 1 — authorization · `tests/test_auth_gateway.py`
+#### Layer 1 — authorization · `tests/test_auth_gateway.py`, `tests/test_guest_tokens.py`
 
 | Condition | Outcome | Test |
 |-----------|---------|------|
 | No gateway header, no token | 200 — the UI and anything on the compose network | `test_an_internal_caller_needs_no_token` |
 | No gateway header, nonsense token | 200 — the token is not looked at | `test_an_internal_caller_may_send_any_token` |
 | Gateway header set to `0`, `true`, `2`, or empty | 200 — only the exact value `1` engages the check | `test_only_the_exact_header_value_engages_the_check` |
-| Gateway + guest token (either entry of the list) or admin token | 200 | `test_accepted_tokens` |
+| Gateway + guest token (the secret from either `owner:token` pair) or admin token | 200 | `test_accepted_tokens` |
+| Gateway + the `owner:token` pair itself | 403 — the header is the secret only | `test_the_owner_token_pair_is_not_a_credential` |
 | Gateway, no token | 403 | `test_a_missing_token_is_refused` |
 | Gateway + empty, wrong, or shorter token | 403 — a length mismatch must not raise out of `compare_digest` | `test_refused_tokens` |
 | Gateway, no token | Neither query runs | `test_a_refused_caller_reads_no_data` |
@@ -1034,6 +1036,14 @@ service.
 | Any write route with an absent or empty `API-Token` header | 401, not 403 — `APIKeyHeader` rejects before `api_token` runs | `test_an_absent_write_token_is_401_not_403` |
 | `GET /healthz` through the gateway, no token | 200 — Docker's healthcheck depends on it | `test_healthz_needs_no_token_through_the_gateway` |
 | `GET /` | Redirect to `/docs` | `test_the_root_redirects_to_the_docs` |
+| `GUEST_API_TOKEN` empty | No guest tokens | `test_empty_string_yields_no_tokens` |
+| Two `owner:token` pairs | Only the secrets are kept | `test_two_pairs_keep_only_the_tokens` |
+| Spaces around commas and colons | Stripped | `test_whitespace_around_commas_and_colons_is_stripped` |
+| Trailing comma | Ignored | `test_a_trailing_comma_is_ignored` |
+| Empty comma segments (leading, middle, trailing) | Skipped | `test_empty_comma_segments_are_skipped` |
+| Token containing colons | Kept in full after the first `:` | `test_a_token_may_contain_colons` |
+| `list[str]` constructor argument | Kept as tokens (no pair parse) | `test_a_list_is_kept_as_tokens` |
+| Bare token, missing `:`, empty owner/secret, or mixed malformed | `ValidationError` at settings load | `test_malformed_entries_are_rejected` |
 
 #### Layer 2 — query validation · `tests/test_query_validation.py`, `tests/test_schemas.py`
 

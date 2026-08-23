@@ -30,11 +30,16 @@ PUBLIC_URL="${PUBLIC_URL:-https://bankiru.uva-advanced.ru}"
 LOOPBACK_URL="${LOOPBACK_URL:-http://127.0.0.1:1706}"
 SKIP_LOOPBACK="${SKIP_LOOPBACK:-0}"
 
-# GUEST_API_TOKEN may hold a comma-separated list; use the first entry.
+# GUEST_API_TOKEN is owner@example.org:token pairs; use the first token.
 # Expanded with :- first: under `set -u` a bare ${GUEST_API_TOKEN%%,*} on an
 # unset variable aborts the shell before the message below can be printed.
+# A bare token (no colon) is left unchanged so a one-off GUEST_API_TOKEN=tok
+# still works. Whitespace trim matches the Settings parser (spaces around `:`).
 GUEST_TOKEN="${GUEST_API_TOKEN:-}"
 GUEST_TOKEN="${GUEST_TOKEN%%,*}"
+GUEST_TOKEN="${GUEST_TOKEN#*:}"
+GUEST_TOKEN="${GUEST_TOKEN#"${GUEST_TOKEN%%[![:space:]]*}"}"
+GUEST_TOKEN="${GUEST_TOKEN%"${GUEST_TOKEN##*[![:space:]]}"}"
 
 if [[ -z "${GUEST_TOKEN}" ]]; then
     echo "GUEST_API_TOKEN is not set — source the secrets first." >&2

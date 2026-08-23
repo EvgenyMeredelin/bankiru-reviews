@@ -24,7 +24,7 @@ from typing import Any
 
 # ── Environment (must precede any bankiru import) ────────────────────────────
 ADMIN_TOKEN = "test-admin-token"
-# Two guest tokens on purpose: GUEST_API_TOKEN is a comma-separated list and
+# Two guest tokens on purpose: GUEST_API_TOKEN is owner:token pairs and
 # the second entry must be accepted just like the first.
 GUEST_TOKEN = "test-guest-token"
 GUEST_TOKEN_SECOND = "test-guest-second"
@@ -32,7 +32,10 @@ GUEST_TOKEN_SECOND = "test-guest-second"
 os.environ.update(
     {
         "API_TOKEN": ADMIN_TOKEN,
-        "GUEST_API_TOKEN": f"{GUEST_TOKEN},{GUEST_TOKEN_SECOND}",
+        "GUEST_API_TOKEN": (
+            f"alice@example.org:{GUEST_TOKEN},"
+            f"bob@example.org:{GUEST_TOKEN_SECOND}"
+        ),
         "POSTGRES_URL": "postgresql+psycopg://test:test@localhost/test",
         "OBS_BUCKET": "test-bucket",
         "OBS_ACCESS_KEY": "test-access-key",

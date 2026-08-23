@@ -67,6 +67,44 @@ def _split_csv(value: object) -> list[str]:
     return []  # type: ignore[unreachable]
 
 
+def _parse_guest_api_tokens(value: object) -> list[str]:
+    """Parse ``owner@example.org:token,...`` into a list of tokens.
+
+    The owner is an Infisical inventory label only and is discarded.
+    Empty input yields ``[]``. Empty comma segments are dropped so a
+    trailing comma does not fail startup. Each remaining pair is split
+    on the first colon so the token itself may contain colons. Both
+    sides must be non-empty after strip, otherwise ``ValueError``.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not isinstance(value, str):
+        return []
+    stripped = value.strip()
+    if not stripped:
+        return []
+    tokens: list[str] = []
+    for item in stripped.split(","):
+        pair = item.strip()
+        if not pair:
+            continue
+        owner, sep, token = pair.partition(":")
+        if not sep:
+            raise ValueError(
+                "GUEST_API_TOKEN entries must be owner@example.org:token"
+            )
+        owner = owner.strip()
+        token = token.strip()
+        if not owner or not token:
+            raise ValueError(
+                "GUEST_API_TOKEN entries must be owner@example.org:token"
+            )
+        tokens.append(token)
+    return tokens
+
+
 # Custom pydantic type: a list[str] that is populated from a single
 # comma-separated environment variable string.
 #   - NoDecode: tells pydantic-settings to pass the raw string through
@@ -74,6 +112,12 @@ def _split_csv(value: object) -> list[str]:
 #   - BeforeValidator: applies _split_csv BEFORE pydantic's own validation,
 #     converting the raw string into a list that pydantic can then validate.
 CommaList = Annotated[list[str], NoDecode, BeforeValidator(_split_csv)]
+
+# Same wiring as CommaList, but each item is ``owner@example.org:token``
+# and only the token is kept.
+GuestTokenList = Annotated[
+    list[str], NoDecode, BeforeValidator(_parse_guest_api_tokens)
+]
 
 
 class Settings(BaseSettings):
@@ -96,11 +140,13 @@ class Settings(BaseSettings):
     # and for GET /reviews when the request arrives via the public Nginx
     # gateway. Checked via the API-Token header.
     API_TOKEN: str
-    # GUEST_API_TOKEN: comma-separated read-only tokens for external clients
-    # calling GET /reviews through https://bankiru.uva-advanced.ru (Nginx
-    # sets X-Bankiru-Gateway). Guests cannot POST/DELETE. Empty → only
-    # API_TOKEN is accepted on the gateway GET path.
-    GUEST_API_TOKEN: CommaList = []
+    # GUEST_API_TOKEN: comma-separated owner@example.org:token pairs for
+    # external clients calling GET /reviews through
+    # https://bankiru.uva-advanced.ru (Nginx sets X-Bankiru-Gateway).
+    # The owner is an Infisical label; only the token is kept. Guests
+    # cannot POST/DELETE. Empty → only API_TOKEN is accepted on the
+    # gateway GET path. Tokens must not contain commas.
+    GUEST_API_TOKEN: GuestTokenList = []
     # LOGFIRE_TOKEN: optional Logfire write token for observability. When None,
     # logfire.configure() falls back to anonymous/local mode.
     LOGFIRE_TOKEN: str | None = None

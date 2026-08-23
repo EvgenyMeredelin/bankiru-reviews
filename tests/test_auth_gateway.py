@@ -59,12 +59,24 @@ async def test_only_the_exact_header_value_engages_the_check(api, value):
     ids=["guest", "second-guest", "admin"],
 )
 async def test_accepted_tokens(api, token):
-    """Both entries of the comma-separated guest list work, as does the admin."""
+    """Tokens from both owner:token pairs work, as does the admin."""
     client, _, _ = api(bounds=BOUNDS, rows=[])
     async with client:
         response = await client.get("/reviews", headers=gateway(token))
 
     assert response.status_code == 200
+
+
+async def test_the_owner_token_pair_is_not_a_credential(api):
+    """The client must send the secret, not the Infisical inventory pair."""
+    client, _, _ = api(bounds=BOUNDS, rows=[])
+    async with client:
+        response = await client.get(
+            "/reviews",
+            headers=gateway(f"alice@example.org:{GUEST_TOKEN}"),
+        )
+
+    assert response.status_code == 403
 
 
 async def test_a_missing_token_is_refused(api):
