@@ -118,3 +118,21 @@ services:
     depends_on:
       api:
         condition: service_healthy
+
+# bankiru-reviews_default is pinned so Docker cannot auto-pick a slice of a
+# Cloud.ru peering range (192.168.0.0/16 vpc-exp, 10.0.0.0/20 vpc-exchange) or
+# of mailcow's 10.42.1.0/24. This stack is the clearest case for why: its
+# Postgres is an external managed instance reached over peering, so an
+# overlapping bridge subnet would steal that route off ens3 and the API would
+# lose its database. The host daemon pool in
+# compose-stacks/host/web-daemon.json is a backstop, not a substitute for the
+# pin. Slots are registered in compose-stacks/README.md — do not reuse one.
+#
+# An existing network keeps its old subnet until `docker compose down` (no -v
+# needed here — this stack owns no named volumes) followed by
+# ./scripts/start.sh. --force-recreate recreates containers only.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.16.89.0/24

@@ -68,6 +68,7 @@
   - [Local development (without Docker)](#local-development-without-docker)
   - [Tests](#tests)
 - [Day-2 operations](#day-2-operations)
+  - [Pinned `bankiru-reviews_default` CIDR](#pinned-bankiru-reviews_default-cidr)
   - [Count reviews per day (with url dedup)](#count-reviews-per-day-with-url-dedup)
   - [Export reviews to CSV on the host (no summarization)](#export-reviews-to-csv-on-the-host-no-summarization)
   - [Changing the daily crawl schedule](#changing-the-daily-crawl-schedule)
@@ -1501,6 +1502,55 @@ The scheduler's `replace_existing=True` ensures the new trigger cleanly replaces
 > - `./scripts/start.sh --refresh` runs `docker compose up -d --build --force-recreate`, which **destroys and recreates** the container — any `docker exec` process is killed as well.
 >
 > Use **Option A** (SIGHUP) to reschedule without interrupting a running crawl.
+
+<a id="pinned-bankiru-reviews_default-cidr"></a>
+
+### Pinned `bankiru-reviews_default` CIDR · [↑](#toc)
+
+**Why.** Cloud.ru peering gives this VM routes into `192.168.0.0/16`
+(`vpc-exp`) and `10.0.0.0/20` (`vpc-exchange`). With no IPAM on the project
+network, Docker picks a subnet itself, and once its built-in `172.17.0.0/12`
+pool is used up the next pick lands inside `vpc-exp`. The kernel then treats
+those addresses as neighbours on the compose bridge instead of peers behind
+`ens3`, and the peered route is gone.
+
+This stack is the sharpest example of why that matters: its Postgres is an
+external managed instance reached over the peering link, so an overlapping
+bridge subnet takes the database away from the API — the containers stay up and
+every request fails. A host-level `default-address-pools` backstop lives in
+`compose-stacks/host/web-daemon.json`; the per-stack pin is what makes the
+subnet deterministic.
+
+**What the repo does.** [`docker-compose.yml`](docker-compose.yml) pins this
+network to `172.16.89.0/24`. Assigned `/24` slots for the whole estate are
+registered in `compose-stacks/README.md` — that table is the single source of
+truth, so take the next free slot from there rather than guessing. Never use
+`192.168.0.0/16`, `10.0.0.0/20`, or `10.42.1.0/24` (mailcow's own network).
+
+**How to apply it to a stack that is already running.** An existing network
+keeps its subnet until it is recreated; `--force-recreate` and
+`start.sh --refresh` recreate containers only. This stack owns no named
+volumes, so `-v` would destroy nothing here — keep the habit of omitting it
+anyway.
+
+```bash
+cd ~/bankiru-reviews
+docker compose --env-file /dev/shm/bankiru-reviews-secrets/.env down
+# docker network rm bankiru-reviews_default   # if an empty leftover remains
+./scripts/start.sh
+```
+
+Confirm afterwards — the `/healthz` probe is the one that proves the peered
+database is still reachable:
+
+```bash
+docker network inspect bankiru-reviews_default \
+  --format '{{(index .IPAM.Config 0).Subnet}}'
+# expect 172.16.89.0/24
+curl -sS http://127.0.0.1:1706/healthz     # {"status":"ok"}
+docker logs bankiru-parser 2>&1 | tail -20 # scheduler re-armed
+ip route get 192.168.0.93   # must still say: via 10.0.0.1 dev ens3
+```
 
 ---
 
