@@ -205,7 +205,7 @@ with gr.Blocks(title="bankiru-reviews", fill_height=True) as gradio_ui:
             '<div class="bankiru-heading">'
             "<span>Banki.ru Claims and Negative Reviews</span>"
             '<span class="bankiru-sep" aria-hidden="true">|</span>'
-            '<a href="https://wiki.uva-advanced.ru/doc/magazin-prilozhenij-oblaka-uva-KPzADBCe27#h-bankiru-bankiru-reviews" '
+            '<a href="https://wiki.uva-advanced.ru/doc/bankiru-bankiru-reviews-rEb8t1fcTt" '
             'target="_blank" rel="noopener noreferrer">Docs</a>'
             "</div>"
         ),
