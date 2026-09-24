@@ -252,21 +252,14 @@ def create_app() -> FastAPI:
         blocks=gradio_ui,
         path="/gradio",
         auth_dependency=get_user,
-        # Ocean theme with zero radius — rectangular controls match the layout
-        # (Gradio's default Ocean theme is heavily rounded).
-        theme=gr.themes.Ocean(radius_size="none").set(
-            button_large_radius="0px",
-            button_medium_radius="0px",
-            button_small_radius="0px",
-            input_radius="0px",
-            block_radius="0px",
-            container_radius="0px",
-            block_label_radius="0px",
-        ),
+        # Smallest non-zero Gradio radius. Default Ocean is radius_xxl.
+        # Buttons resolve to 4px (*radius_md); inputs and blocks to 2px (*radius_sm).
+        theme=gr.themes.Ocean(radius_size="sm"),
         # Custom CSS injected into the Gradio mount:
         #   - hide the "Built with Gradio" footer
         #   - match summary panel bottom inset to horizontal block padding
-        #   - square corners on dropdowns/textboxes/accordion if theme tokens miss inner chrome
+        #   - same small radius on dropdowns/textboxes/accordion when theme tokens miss inner chrome
+        #     (DateTime .time keeps Gradio's left-only --input-radius so it joins the calendar button)
         #   - slightly larger labels on Submit / Clear / Download only
         #     (scoped via .action-btn so DateTime picker chrome is untouched)
         css="""
@@ -275,11 +268,11 @@ footer {visibility: hidden}
 #summary-panel .padding {
     padding-bottom: calc(var(--spacing-xl) + 2px);
 }
-input, textarea, select, .wrap, .multiselect, .input-container {
-    border-radius: 0 !important;
+input:not(.time), textarea, select, .wrap, .multiselect, .input-container {
+    border-radius: var(--radius-sm) !important;
 }
 .accordion, .accordion > button, details, summary {
-    border-radius: 0 !important;
+    border-radius: var(--radius-sm) !important;
 }
 .action-btn {
     font-size: 1.1rem !important;
